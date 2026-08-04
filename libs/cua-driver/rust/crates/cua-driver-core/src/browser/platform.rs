@@ -152,6 +152,10 @@ pub struct ExistingProfileSetupOutcome {
 pub enum BrowserConsentOutcome {
     /// One exact browser-owned consent action was semantically pressed.
     Accepted,
+    /// The adapter proved one exact browser-owned prompt and left the action
+    /// to the person. The already-pending transport remains the sole proof of
+    /// acceptance; this observation must never authorize a fresh dial.
+    UserDecisionPending,
     /// The adapter proved no consent prompt was present in the approved scope.
     NotPresent,
 }
@@ -345,6 +349,10 @@ pub trait BrowserPlatform: Send + Sync {
     /// Handle one pending browser-owned connection prompt. Implementations
     /// must use exact native semantics and may perform at most one declared
     /// consent action for this request. Generic dialog automation is forbidden.
+    fn existing_profile_consent_requires_user_presence(&self) -> bool {
+        false
+    }
+
     async fn handle_existing_profile_consent(
         &self,
         _request: BrowserConsentRequest,

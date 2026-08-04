@@ -31,27 +31,51 @@ use super::BrowserEngine;
 const PROFILE_MARKER: &str = ".cua-driver-owned-profile.json";
 const PROFILE_SCHEMA: &str = "cua-driver-browser-profile-v1";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsentEvidence {
+    None,
+    AdapterAccepted,
+    UserPresence,
+}
+
+impl ConsentEvidence {
+    fn displayed_prompt(self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    fn permits_fresh_dial(self) -> bool {
+        matches!(self, Self::AdapterAccepted)
+    }
+}
+
 async fn claim_with_optional_consent<T, Claim, Consent>(
     claim: &mut Pin<Box<Claim>>,
     consent: Consent,
-) -> Result<(anyhow::Result<T>, bool), BrowserRefusal>
+) -> Result<(anyhow::Result<T>, ConsentEvidence), BrowserRefusal>
 where
     Claim: Future<Output = anyhow::Result<T>>,
     Consent: Future<Output = Result<BrowserConsentOutcome, BrowserRefusal>>,
 {
     let mut consent = Box::pin(consent);
     tokio::select! {
-        result = claim.as_mut() => Ok((result, false)),
+        result = claim.as_mut() => Ok((result, ConsentEvidence::None)),
         outcome = consent.as_mut() => match outcome? {
-            BrowserConsentOutcome::Accepted => Ok((claim.as_mut().await, true)),
-            BrowserConsentOutcome::NotPresent => Ok((claim.as_mut().await, false)),
+            BrowserConsentOutcome::Accepted => {
+                Ok((claim.as_mut().await, ConsentEvidence::AdapterAccepted))
+            }
+            BrowserConsentOutcome::UserDecisionPending => {
+                Ok((claim.as_mut().await, ConsentEvidence::UserPresence))
+            }
+            BrowserConsentOutcome::NotPresent => {
+                Ok((claim.as_mut().await, ConsentEvidence::None))
+            }
         },
     }
 }
 
 async fn retry_claim_after_accepted_consent<T, Retry>(
     initial: anyhow::Result<T>,
-    accepted_consent: bool,
+    consent_evidence: ConsentEvidence,
     retry: Retry,
 ) -> (anyhow::Result<T>, Option<anyhow::Error>)
 where
@@ -59,7 +83,9 @@ where
 {
     match initial {
         Ok(value) => (Ok(value), None),
-        Err(initial_error) if accepted_consent => (retry.await, Some(initial_error)),
+        Err(initial_error) if consent_evidence.permits_fresh_dial() => {
+            (retry.await, Some(initial_error))
+        }
         Err(error) => (Err(error), None),
     }
 }
@@ -1077,7 +1103,7 @@ impl BrowserEngine {
                 self.pool.release_claim_marker(&previous.endpoint_ws_url);
             }
         }
-        let (claimed, displayed_consent_prompt) = {
+        let (claimed, consent_evidence) = {
             let ws_url = endpoint.ws_url.clone();
             let mut claim = Box::pin(self.pool.claim_existing(&ws_url, grant.generation));
             let initial = tokio::select! {
@@ -1085,7 +1111,7 @@ impl BrowserEngine {
                 _ = tokio::time::sleep(Duration::from_millis(500)) => None,
             };
             if let Some(result) = initial {
-                (result, false)
+                (result, ConsentEvidence::None)
             } else {
                 match claim_with_optional_consent(
                     &mut claim,
@@ -1123,6 +1149,7 @@ impl BrowserEngine {
                 }
             }
         };
+        let displayed_consent_prompt = consent_evidence.displayed_prompt();
         // Chrome on Windows can reject the WebSocket handshake that was
         // pending while its native remote-debugging consent prompt was open.
         // After an explicit acceptance, make one fresh, bounded dial to the
@@ -1131,7 +1158,7 @@ impl BrowserEngine {
         // still owns any transport-level UI for the fresh connection.
         let (claimed, initial_claim_error) = retry_claim_after_accepted_consent(
             claimed,
-            displayed_consent_prompt,
+            consent_evidence,
             self.pool.claim_existing(&endpoint.ws_url, grant.generation),
         )
         .await;
@@ -1150,6 +1177,7 @@ impl BrowserEngine {
                 .with_detail(serde_json::json!({
                     "retried_after_consent": initial_claim_error.is_some(),
                     "fresh_claim_failed": initial_claim_error.is_some(),
+                    "user_presence": consent_evidence == ConsentEvidence::UserPresence,
                 })),
                 &setup,
                 displayed_consent_prompt,
@@ -1233,11 +1261,11 @@ mod tests {
                 "no consent surface",
             ))
         };
-        let (result, displayed) = claim_with_optional_consent(&mut claim, consent)
+        let (result, evidence) = claim_with_optional_consent(&mut claim, consent)
             .await
             .expect("the completed claim should win the race");
         assert_eq!(result.unwrap(), 7);
-        assert!(!displayed);
+        assert_eq!(evidence, ConsentEvidence::None);
     }
 
     #[tokio::test]
@@ -1246,19 +1274,36 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             Ok::<_, anyhow::Error>(9_u8)
         });
-        let (result, displayed) =
+        let (result, evidence) =
             claim_with_optional_consent(&mut claim, async { Ok(BrowserConsentOutcome::Accepted) })
                 .await
                 .expect("accepted consent should resume the existing claim");
         assert_eq!(result.unwrap(), 9);
-        assert!(displayed);
+        assert_eq!(evidence, ConsentEvidence::AdapterAccepted);
+    }
+
+    #[tokio::test]
+    async fn user_presence_waits_for_the_same_pending_claim() {
+        let mut claim = Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            Ok::<_, anyhow::Error>(10_u8)
+        });
+        let (result, evidence) = claim_with_optional_consent(&mut claim, async {
+            Ok(BrowserConsentOutcome::UserDecisionPending)
+        })
+        .await
+        .expect("user presence should leave authorization to the pending socket");
+        assert_eq!(result.unwrap(), 10);
+        assert_eq!(evidence, ConsentEvidence::UserPresence);
+        assert!(evidence.displayed_prompt());
+        assert!(!evidence.permits_fresh_dial());
     }
 
     #[tokio::test]
     async fn accepted_consent_retries_one_failed_claim_with_a_fresh_dial() {
         let (result, initial_error) = retry_claim_after_accepted_consent(
             Err(anyhow::anyhow!("pre-consent handshake rejected")),
-            true,
+            ConsentEvidence::AdapterAccepted,
             async { Ok::<_, anyhow::Error>(11_u8) },
         )
         .await;
@@ -1275,7 +1320,7 @@ mod tests {
         let retry_marker = retry_polled.clone();
         let (result, initial_error) = retry_claim_after_accepted_consent(
             Err::<u8, _>(anyhow::anyhow!("connection refused")),
-            false,
+            ConsentEvidence::None,
             async move {
                 retry_marker.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok::<_, anyhow::Error>(12_u8)
@@ -1291,13 +1336,37 @@ mod tests {
     async fn successful_claim_does_not_retry_after_accepted_consent() {
         let retry_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let retry_marker = retry_polled.clone();
-        let (result, initial_error) =
-            retry_claim_after_accepted_consent(Ok::<_, anyhow::Error>(13_u8), true, async move {
+        let (result, initial_error) = retry_claim_after_accepted_consent(
+            Ok::<_, anyhow::Error>(13_u8),
+            ConsentEvidence::AdapterAccepted,
+            async move {
                 retry_marker.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok::<_, anyhow::Error>(14_u8)
-            })
-            .await;
+            },
+        )
+        .await;
         assert_eq!(result.unwrap(), 13);
+        assert!(initial_error.is_none());
+        assert!(!retry_polled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn user_presence_rejection_never_polls_a_fresh_dial() {
+        let retry_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let retry_marker = retry_polled.clone();
+        let (result, initial_error) = retry_claim_after_accepted_consent(
+            Err::<u8, _>(anyhow::anyhow!("browser rejected pending handshake")),
+            ConsentEvidence::UserPresence,
+            async move {
+                retry_marker.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, anyhow::Error>(15_u8)
+            },
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "browser rejected pending handshake"
+        );
         assert!(initial_error.is_none());
         assert!(!retry_polled.load(std::sync::atomic::Ordering::SeqCst));
     }
@@ -1308,7 +1377,7 @@ mod tests {
         let attempt_counter = attempts.clone();
         let (result, initial_error) = retry_claim_after_accepted_consent(
             Err::<u8, _>(anyhow::anyhow!("pre-consent handshake rejected")),
-            true,
+            ConsentEvidence::AdapterAccepted,
             async move {
                 attempt_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Err::<u8, _>(anyhow::anyhow!("fresh handshake rejected"))

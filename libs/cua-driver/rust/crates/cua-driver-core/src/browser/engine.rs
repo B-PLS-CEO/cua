@@ -745,6 +745,9 @@ impl BrowserEngine {
             return Ok((conn, grant));
         }
 
+        let user_presence_required = self
+            .platform
+            .existing_profile_consent_requires_user_presence();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(32);
         let mut last_error = None;
         while tokio::time::Instant::now() < deadline && grant.reconnect_attempts_remaining > 0 {
@@ -815,16 +818,23 @@ impl BrowserEngine {
                 old_generation,
                 new_generation,
             ));
-            let reconnected = tokio::select! {
-                result = &mut reconnect => result,
+            let (reconnected, user_presence_attempt) = tokio::select! {
+                result = &mut reconnect => (result, user_presence_required),
                 _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
                     match self.platform.handle_existing_profile_consent(BrowserConsentRequest {
                         pid,
                         window_id: grant.window_id,
                         attempt,
-                    }).await {
+                        }).await {
                         Ok(BrowserConsentOutcome::Accepted | BrowserConsentOutcome::NotPresent) => {
-                            reconnect.await
+                            (reconnect.await, user_presence_required)
+                        }
+                        Ok(BrowserConsentOutcome::UserDecisionPending) => {
+                            // The exact prompt was observed but the adapter did
+                            // not act. Only this already-pending socket can
+                            // prove Allow; any failure ends the reconnect so a
+                            // Cancel/timeout cannot create another prompt.
+                            (reconnect.await, true)
                         }
                         Err(error) => {
                             // The reconnect future may be waiting on browser
@@ -850,6 +860,19 @@ impl BrowserEngine {
                 }
                 Err(error) => {
                     last_error = Some(error.to_string());
+                    if user_presence_attempt {
+                        self.revoke_existing_profile_grant(session, transport_session, pid)
+                            .await;
+                        return Err(refuse(
+                            BrowserRefusalCode::BrowserReconnectExhausted,
+                            "the browser did not authorize the pending existing-profile socket",
+                        )
+                        .with_detail(json!({
+                            "attempt_limit": 1,
+                            "user_presence": true,
+                            "retryable": false,
+                        })));
+                    }
                     grant = self
                         .existing_profile_grant(session, transport_session, pid)
                         .await?
