@@ -360,7 +360,13 @@ approval and saves the result under an existing canonical absolute
 serializes Chromium's browser-wide download setting, restores that setting on
 every outcome, and returns only an opaque download id and byte count. It never
 returns the source URL, filename, or destination path. Direct raw calls without
-the host approval proof are refused.
+the host approval proof are refused. The default `delivery_mode:"background"`
+keeps the existing synthetic DOM activation and never foregrounds the browser.
+If a current ref's provider handler requires a trusted event, re-snapshot and
+retry only after explicit approval with `delivery_mode:"foreground"`. That
+rung uses trusted CDP Input, may visibly activate a standalone browser, and is
+bound into both the exact browser-resource and file-transfer approval scopes;
+the same download-event and contained-file receipt remains mandatory.
 
 ## Browser chrome and native fallbacks
 

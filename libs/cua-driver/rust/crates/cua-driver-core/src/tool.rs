@@ -1803,16 +1803,32 @@ impl ToolRegistry {
                 let destination =
                     canonical_existing_directory(required_path_arg(args, "destination_root")?)?;
                 args["destination_root"] = Value::String(destination.clone());
+                let delivery_mode = match args.get("delivery_mode") {
+                    None => "background",
+                    Some(Value::String(mode)) if mode == "background" || mode == "foreground" => {
+                        mode.as_str()
+                    }
+                    _ => {
+                        return Err(ToolResult::error(
+                            "delivery_mode must be background or foreground",
+                        ))
+                    }
+                };
                 (
                     serde_json::json!({
                         "kind": "browser_download",
                         "target_id": args.get("target_id").and_then(Value::as_str),
                         "tab_id": args.get("tab_id").and_then(Value::as_str),
                         "ref": args.get("ref").and_then(Value::as_str),
+                        "delivery_mode": delivery_mode,
                         "direction": "browser_to_local",
                         "canonical_destination_root": destination,
                     }),
-                    "Allow Cua to download one file from this browser tab to the exact destination directory".to_owned(),
+                    if delivery_mode == "foreground" {
+                        "Allow Cua to visibly activate this exact browser control and download one file to the exact destination directory".to_owned()
+                    } else {
+                        "Allow Cua to download one file from this browser tab to the exact destination directory".to_owned()
+                    },
                 )
             }
             "clipboard_write" => {
