@@ -120,6 +120,7 @@ fn tools_list_schema_shape() {
         "hotkey",
         "scroll",
         "browser_dialog",
+        "browser_download",
     ];
     for tool in DELIVERY_MODE_TOOLS {
         let delivery = &properties(tool)["delivery_mode"];

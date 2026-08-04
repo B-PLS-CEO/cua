@@ -172,6 +172,7 @@ pub(crate) async fn browser_protected_resource_scope(
         "get_browser_state" => "page_observation",
         "browser_navigate" => "navigation",
         "browser_dialog" => "page_dialog_resolution",
+        "browser_download" => "file_transfer",
         _ => "page_input",
     };
     let mut resource = json!({
@@ -187,15 +188,20 @@ pub(crate) async fn browser_protected_resource_scope(
         "requested_origin": requested_origin,
         "action_class": action_class,
     });
-    if tool_name == "browser_dialog" {
-        resource["dialog_id"] = args.get("dialog_id").cloned().unwrap_or(Value::Null);
-        resource["dialog_action"] = args.get("action").cloned().unwrap_or(Value::Null);
+    if matches!(tool_name, "browser_dialog" | "browser_download") {
         resource["delivery_mode"] = Value::String(
             args.get("delivery_mode")
                 .and_then(Value::as_str)
                 .unwrap_or("background")
                 .to_owned(),
         );
+    }
+    if tool_name == "browser_download" {
+        resource["ref"] = args.get("ref").cloned().unwrap_or(Value::Null);
+    }
+    if tool_name == "browser_dialog" {
+        resource["dialog_id"] = args.get("dialog_id").cloned().unwrap_or(Value::Null);
+        resource["dialog_action"] = args.get("action").cloned().unwrap_or(Value::Null);
         resource["prompt_text_present"] =
             Value::Bool(args.get("prompt_text").and_then(Value::as_str).is_some());
     }
@@ -1305,7 +1311,7 @@ impl Tool for BrowserClickTool {
 }
 
 /// Center of the content quad from a `DOM.getBoxModel` result.
-fn quad_center(box_model: &Value) -> Option<(f64, f64)> {
+pub(super) fn quad_center(box_model: &Value) -> Option<(f64, f64)> {
     let quad = box_model.get("model")?.get("content")?.as_array()?;
     if quad.len() < 8 {
         return None;

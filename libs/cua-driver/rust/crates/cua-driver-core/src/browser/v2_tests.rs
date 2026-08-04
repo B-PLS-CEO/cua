@@ -1968,6 +1968,25 @@ async fn protected_browser_scope_reproves_live_origin_and_omits_sensitive_url_te
     assert_eq!(observation["action_class"], "page_observation");
     assert_eq!(first["action_class"], "page_input");
 
+    let download = browser_protected_resource_scope(
+        &f.engine,
+        &json!({
+            "target_id": target,
+            "tab_id": tab,
+            "session": SESSION,
+            "ref": "sem_exact_download",
+            "delivery_mode": "foreground",
+        }),
+        "browser_download",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(download["action_class"], "file_transfer");
+    assert_eq!(download["ref"], "sem_exact_download");
+    assert_eq!(download["delivery_mode"], "foreground");
+    assert_eq!(download["live_origin"], "https://fixture.test");
+
     f.state.lock().unwrap().main_url = "https://bank.example/transfer?secret=one-time-token".into();
     let second = browser_protected_resource_scope(&f.engine, &args, "browser_click")
         .await
