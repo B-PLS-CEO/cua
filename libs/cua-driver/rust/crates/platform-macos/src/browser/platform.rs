@@ -185,19 +185,52 @@ fn parse_devtools_active_port(text: &str) -> Option<(u16, &str)> {
     .then_some((port, path))
 }
 
-async fn process_uses_custom_user_data_dir(pid: i64) -> Result<bool, BrowserRefusal> {
-    let output = tokio::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
+async fn bounded_identity_command(
+    program: &'static str,
+    arguments: Vec<String>,
+    failure_context: String,
+) -> Result<std::process::Output, BrowserRefusal> {
+    let task = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(program)
+            .args(arguments)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+    });
+    tokio::time::timeout(Duration::from_secs(2), task)
         .await
+        .map_err(|_| {
+            refusal(
+                BrowserRefusalCode::BrowserRouteUnavailable,
+                format!("{failure_context}: command exceeded the 2-second identity-probe bound"),
+            )
+        })?
         .map_err(|error| {
             refusal(
                 BrowserRefusalCode::BrowserRouteUnavailable,
-                format!("could not inspect browser arguments for pid {pid}: {error}"),
+                format!("{failure_context}: command task failed: {error}"),
             )
-        })?;
+        })?
+        .map_err(|error| {
+            refusal(
+                BrowserRefusalCode::BrowserRouteUnavailable,
+                format!("{failure_context}: {error}"),
+            )
+        })
+}
+
+async fn process_uses_custom_user_data_dir(pid: i64) -> Result<bool, BrowserRefusal> {
+    let output = bounded_identity_command(
+        "ps",
+        vec![
+            "-p".to_owned(),
+            pid.to_string(),
+            "-o".to_owned(),
+            "command=".to_owned(),
+        ],
+        format!("could not inspect browser arguments for pid {pid}"),
+    )
+    .await?;
     if !output.status.success() {
         return Err(refusal(
             BrowserRefusalCode::BrowserBindingStale,
@@ -224,18 +257,19 @@ fn exact_browser_surface_ids(
 }
 
 async fn process_details(pid: i64) -> Result<(String, String), BrowserRefusal> {
-    let output = tokio::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "lstart=", "-o", "comm="])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .await
-        .map_err(|error| {
-            refusal(
-                BrowserRefusalCode::BrowserRouteUnavailable,
-                format!("could not inspect browser process {pid}: {error}"),
-            )
-        })?;
+    let output = bounded_identity_command(
+        "ps",
+        vec![
+            "-p".to_owned(),
+            pid.to_string(),
+            "-o".to_owned(),
+            "lstart=".to_owned(),
+            "-o".to_owned(),
+            "comm=".to_owned(),
+        ],
+        format!("could not inspect browser process {pid}"),
+    )
+    .await?;
     if !output.status.success() {
         return Err(refusal(
             BrowserRefusalCode::BrowserBindingStale,
@@ -276,26 +310,20 @@ fn parse_loopback_lsof_ports(text: &str) -> Vec<u16> {
 }
 
 async fn loopback_ports_for_pid(pid: i64) -> Result<Vec<u16>, BrowserRefusal> {
-    let output = tokio::process::Command::new("lsof")
-        .args([
-            "-a",
-            "-p",
-            &pid.to_string(),
-            "-iTCP",
-            "-sTCP:LISTEN",
-            "-Fn",
-            "-P",
-        ])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .await
-        .map_err(|error| {
-            refusal(
-                BrowserRefusalCode::BrowserRouteUnavailable,
-                format!("could not inspect browser listeners: {error}"),
-            )
-        })?;
+    let output = bounded_identity_command(
+        "lsof",
+        vec![
+            "-a".to_owned(),
+            "-p".to_owned(),
+            pid.to_string(),
+            "-iTCP".to_owned(),
+            "-sTCP:LISTEN".to_owned(),
+            "-Fn".to_owned(),
+            "-P".to_owned(),
+        ],
+        "could not inspect browser listeners".to_owned(),
+    )
+    .await?;
     Ok(parse_loopback_lsof_ports(&String::from_utf8_lossy(
         &output.stdout,
     )))
@@ -881,6 +909,10 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                     format!("could not roll back exact browser setup: {join_error}"),
                 )
             })
+    }
+
+    fn existing_profile_consent_requires_user_presence(&self) -> bool {
+        super::consent_ui::user_presence_required()
     }
 
     async fn handle_existing_profile_consent(
