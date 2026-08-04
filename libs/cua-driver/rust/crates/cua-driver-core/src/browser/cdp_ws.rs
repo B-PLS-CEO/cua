@@ -29,6 +29,11 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+// A person may need longer than an ordinary transport dial to act on a
+// browser-owned prompt. This applies only to an already-authorized,
+// exact existing-profile claim/reconnect; ordinary CDP connections retain the
+// short failure bound above. It must outlive the 30-second user decision UX.
+const EXISTING_PROFILE_CONNECT_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// Validate that `url` is a plain-`ws` loopback WebSocket URL.
 /// Anything else — `wss`, remote hosts, hostnames that merely *resolve*
@@ -204,9 +209,13 @@ impl Drop for CdpConnection {
 
 impl CdpConnection {
     pub async fn connect(ws_url: &str) -> anyhow::Result<Self> {
+        Self::connect_with_timeout(ws_url, CONNECT_TIMEOUT).await
+    }
+
+    async fn connect_with_timeout(ws_url: &str, connect_timeout: Duration) -> anyhow::Result<Self> {
         validate_loopback_ws_url(ws_url).map_err(|e| anyhow::anyhow!(e))?;
         let (ws, _resp) =
-            tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(ws_url))
+            tokio::time::timeout(connect_timeout, tokio_tungstenite::connect_async(ws_url))
                 .await
                 .map_err(|_| anyhow::anyhow!("CDP connect to {ws_url} timed out"))??;
         let (write, read) = ws.split();
@@ -419,7 +428,10 @@ impl CdpPool {
         let conn = match conns.get(ws_url) {
             Some(entry) if !entry.conn.is_closed() => entry.conn.clone(),
             Some(_) => anyhow::bail!("the approved browser socket closed before it was claimed"),
-            None => Arc::new(CdpConnection::connect(ws_url).await?),
+            None => Arc::new(
+                CdpConnection::connect_with_timeout(ws_url, EXISTING_PROFILE_CONNECT_TIMEOUT)
+                    .await?,
+            ),
         };
         conns.insert(
             ws_url.to_owned(),
@@ -480,7 +492,9 @@ impl CdpPool {
         // A WebSocket handshake can wait for browser-owned consent UI. Never
         // hold the pool mutex across that wait: grant revocation must remain
         // able to remove the old generation when consent is refused.
-        let conn = Arc::new(CdpConnection::connect(ws_url).await?);
+        let conn = Arc::new(
+            CdpConnection::connect_with_timeout(ws_url, EXISTING_PROFILE_CONNECT_TIMEOUT).await?,
+        );
         let mut conns = self.conns.lock().await;
         if let Some(entry) = conns.get(ws_url) {
             if entry
@@ -569,6 +583,15 @@ mod tests {
     use crate::browser::mock_cdp::{MockCdpServer, MockEvent, MockReply};
     use serde_json::json;
     use std::sync::Arc as StdArc;
+
+    #[test]
+    fn existing_profile_handshake_outlives_the_user_decision_window() {
+        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(10));
+        assert!(
+            EXISTING_PROFILE_CONNECT_TIMEOUT > Duration::from_secs(30),
+            "the pending socket must remain live for the full user-presence window"
+        );
+    }
 
     #[test]
     fn loopback_urls_are_accepted() {

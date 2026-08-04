@@ -666,6 +666,7 @@ struct FixturePlatform {
     setup_invoked: Arc<AtomicBool>,
     setup_aborted: Arc<AtomicBool>,
     stall_consent: bool,
+    user_decision_pending: bool,
 }
 
 #[async_trait]
@@ -808,6 +809,9 @@ impl BrowserPlatform for FixturePlatform {
         &self,
         _request: BrowserConsentRequest,
     ) -> Result<BrowserConsentOutcome, BrowserRefusal> {
+        if self.user_decision_pending {
+            return Ok(BrowserConsentOutcome::UserDecisionPending);
+        }
         if self.stall_consent {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             return Ok(BrowserConsentOutcome::NotPresent);
@@ -872,6 +876,7 @@ async fn fixture_with_platform(
         setup_invoked: setup_invoked.clone(),
         setup_aborted: Arc::new(AtomicBool::new(false)),
         stall_consent: false,
+        user_decision_pending: false,
     }));
     Fixture {
         state,
@@ -897,6 +902,7 @@ async fn existing_profile_only_fixture() -> Fixture {
         setup_invoked: setup_invoked.clone(),
         setup_aborted: Arc::new(AtomicBool::new(false)),
         stall_consent: false,
+        user_decision_pending: false,
     }));
     Fixture {
         state,
@@ -944,6 +950,7 @@ async fn protected_existing_profile_fixture() -> (Fixture, Arc<FixtureProtectedP
             setup_invoked: setup_invoked.clone(),
             setup_aborted: Arc::new(AtomicBool::new(false)),
             stall_consent: false,
+            user_decision_pending: false,
         }),
         Some(provider.clone()),
     );
@@ -970,6 +977,7 @@ async fn existing_profile_setup_fixture() -> (Fixture, Arc<AtomicBool>) {
         setup_invoked: setup_invoked.clone(),
         setup_aborted: Arc::new(AtomicBool::new(false)),
         stall_consent: false,
+        user_decision_pending: false,
     }));
     (
         Fixture {
@@ -1141,6 +1149,7 @@ async fn refused_consent_cancels_stalled_claim_before_revoking_grant() {
         setup_invoked: Arc::new(AtomicBool::new(false)),
         setup_aborted: Arc::new(AtomicBool::new(false)),
         stall_consent: false,
+        user_decision_pending: false,
     }));
     let token = super::approval::mint_existing_profile_approval(
         super::approval::ExistingProfileApprovalScope {
@@ -1171,6 +1180,66 @@ async fn refused_consent_cancels_stalled_claim_before_revoking_grant() {
 }
 
 #[tokio::test]
+async fn user_presence_rejection_never_redials_or_reprompts() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (first, _) = listener.accept().await.unwrap();
+        // Keep the initial handshake pending long enough for core to prove the
+        // exact user-presence prompt, then reject that same transport.
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        drop(first);
+        if tokio::time::timeout(std::time::Duration::from_secs(1), listener.accept())
+            .await
+            .is_ok()
+        {
+            2
+        } else {
+            1
+        }
+    });
+    let engine = BrowserEngine::new(Arc::new(FixturePlatform {
+        ws_url: format!("ws://{address}/devtools/browser"),
+        trusted_input_limited: false,
+        managed_endpoint_visible: false,
+        existing_endpoint_visible: Arc::new(AtomicBool::new(false)),
+        setup_invoked: Arc::new(AtomicBool::new(false)),
+        setup_aborted: Arc::new(AtomicBool::new(false)),
+        stall_consent: false,
+        user_decision_pending: true,
+    }));
+    let token = super::approval::mint_existing_profile_approval(
+        super::approval::ExistingProfileApprovalScope {
+            pid: 1,
+            window_id: 7,
+            session: SESSION.to_owned(),
+        },
+    )
+    .unwrap();
+
+    let prepared = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        BrowserPrepareTool::new(engine).invoke(json!({
+            "pid": 1,
+            "window_id": 7,
+            "session": SESSION,
+            "strategy": { "kind": "existing_profile" },
+            "approval_token": token
+        })),
+    )
+    .await
+    .expect("user-presence rejection must remain bounded");
+    let structured = structured(&prepared);
+    assert_eq!(structured["status"], "refused");
+    assert_eq!(structured["refusal"]["code"], "browser_reconnect_exhausted");
+    assert_eq!(
+        structured["refusal"]["detail"]["displayed_consent_prompt"],
+        true
+    );
+    assert_eq!(server.await.unwrap(), 1, "user presence must never redial");
+}
+
+#[tokio::test]
 async fn cancelled_prepare_aborts_the_exact_pending_setup() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -1187,6 +1256,7 @@ async fn cancelled_prepare_aborts_the_exact_pending_setup() {
         setup_invoked: Arc::new(AtomicBool::new(false)),
         setup_aborted: setup_aborted.clone(),
         stall_consent: true,
+        user_decision_pending: false,
     }));
     let token = super::approval::mint_existing_profile_approval(
         super::approval::ExistingProfileApprovalScope {

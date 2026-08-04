@@ -133,9 +133,37 @@ fn exact_allow_button(nodes: &[AXNode]) -> Result<Option<usize>, BrowserRefusal>
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsentCandidateDisposition {
+    AwaitUserDecision,
+    Press(usize),
+}
+
+fn candidate_disposition(
+    user_presence_required: bool,
+    element: usize,
+) -> ConsentCandidateDisposition {
+    if user_presence_required {
+        ConsentCandidateDisposition::AwaitUserDecision
+    } else {
+        ConsentCandidateDisposition::Press(element)
+    }
+}
+
+pub(crate) fn user_presence_required() -> bool {
+    std::env::var("CUA_DRIVER_BROWSER_CONSENT_MODE")
+        .is_ok_and(|value| value.eq_ignore_ascii_case("user_presence"))
+}
+
 pub async fn handle(
     request: BrowserConsentRequest,
 ) -> Result<BrowserConsentOutcome, BrowserRefusal> {
+    // Embedding hosts that require a person to authorize the browser-owned
+    // remote-debugging sheet can opt out of Cua Driver's semantic AXPress.
+    // The already-pending WebSocket claim remains the source of truth: an
+    // Allow click lets that claim complete, while Cancel closes/rejects it.
+    // Keeping this opt-in preserves the existing standalone behavior.
+    let user_presence_required = user_presence_required();
     let pid = i32::try_from(request.pid).map_err(|_| {
         refusal(
             BrowserRefusalCode::BrowserWrongTargetRefused,
@@ -148,6 +176,9 @@ pub async fn handle(
             "the approved browser window is outside the macOS window-id range",
         )
     })?;
+    // This bounds only prompt discovery. Once a user-presence prompt is
+    // proven, core waits on the same pending WebSocket under the longer,
+    // existing-profile-specific transport bound.
     let deadline = Instant::now() + Duration::from_secs(4);
     let mut saw_prompt = false;
     let mut accepted_prompt = false;
@@ -199,7 +230,24 @@ pub async fn handle(
             return Err(error);
         }
         if let [element] = candidates.as_slice() {
-            let pressed = unsafe { perform_action(*element as AXUIElementRef, "AXPress") };
+            if candidate_disposition(user_presence_required, *element)
+                == ConsentCandidateDisposition::AwaitUserDecision
+            {
+                // Release the retained AX nodes without performing the
+                // browser-owned action. Exact prompt+Allow proof is only
+                // evidence that a decision is pending; the same WebSocket
+                // must succeed before core can authorize the attachment.
+                for nodes in &trees {
+                    release_actionable_nodes(nodes);
+                }
+                return Ok(BrowserConsentOutcome::UserDecisionPending);
+            }
+            let ConsentCandidateDisposition::Press(element) =
+                candidate_disposition(user_presence_required, *element)
+            else {
+                unreachable!("user-presence disposition returned above")
+            };
+            let pressed = unsafe { perform_action(element as AXUIElementRef, "AXPress") };
             for nodes in &trees {
                 release_actionable_nodes(nodes);
             }
@@ -301,6 +349,18 @@ mod tests {
         assert_eq!(
             exact_allow_button(&nodes).unwrap_err().code,
             BrowserRefusalCode::BrowserWrongTargetRefused
+        );
+    }
+
+    #[test]
+    fn user_presence_never_selects_axpress_for_an_exact_allow_candidate() {
+        assert_eq!(
+            candidate_disposition(true, 7),
+            ConsentCandidateDisposition::AwaitUserDecision
+        );
+        assert_eq!(
+            candidate_disposition(false, 7),
+            ConsentCandidateDisposition::Press(7)
         );
     }
 
