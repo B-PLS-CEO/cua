@@ -17,7 +17,8 @@ use crate::tool::{ProtectedResourceOwnership, Tool, ToolDef};
 use crate::tool_args::ArgsExt;
 
 use super::cdp_ws::CdpConnection;
-use super::engine::BrowserEngine;
+use super::engine::{viewport_point_to_screen, BrowserEngine};
+use super::platform::{BrowserVisualActionKind, NativeBrowserActivationRequest};
 use super::refusal::{BrowserRefusal, BrowserRefusalCode};
 use super::store::BrowserActionKind;
 use super::tools::{browser_protected_resource_scope, browser_resource_ownership, quad_center};
@@ -85,9 +86,9 @@ impl BrowserDownloadTool {
 fn download_delivery_mode_schema() -> Value {
     json!({
         "type": "string",
-        "enum": ["background", "foreground"],
+        "enum": ["background", "foreground", "native_foreground"],
         "default": "background",
-        "description": "background (default) preserves the existing synthetic DOM activation. foreground explicitly permits a trusted CDP Input activation that may visibly activate a standalone browser; use only after the background route cannot initiate the approved download."
+        "description": "background (default) preserves the existing synthetic DOM activation. foreground explicitly permits trusted CDP Input. native_foreground permits guarded native input at the exact main-frame ref point. Both foreground rungs may visibly activate a standalone browser and require explicit approval."
     })
 }
 
@@ -95,6 +96,7 @@ fn download_delivery_mode_schema() -> Value {
 enum DownloadDeliveryMode {
     Background,
     Foreground,
+    NativeForeground,
 }
 
 fn delivery_mode(args: &Value) -> Result<DownloadDeliveryMode, ToolResult> {
@@ -102,8 +104,11 @@ fn delivery_mode(args: &Value) -> Result<DownloadDeliveryMode, ToolResult> {
         None => Ok(DownloadDeliveryMode::Background),
         Some(Value::String(mode)) if mode == "background" => Ok(DownloadDeliveryMode::Background),
         Some(Value::String(mode)) if mode == "foreground" => Ok(DownloadDeliveryMode::Foreground),
+        Some(Value::String(mode)) if mode == "native_foreground" => {
+            Ok(DownloadDeliveryMode::NativeForeground)
+        }
         _ => Err(ToolResult::error(
-            "delivery_mode must be background or foreground",
+            "delivery_mode must be background, foreground, or native_foreground",
         )),
     }
 }
@@ -609,6 +614,97 @@ impl Tool for BrowserDownloadTool {
                     }
                 }
             }
+            DownloadDeliveryMode::NativeForeground => {
+                if ref_session != validated.cdp_session {
+                    Err(BrowserRefusal::new(
+                        BrowserRefusalCode::BrowserInputTrustUnavailable,
+                        "native foreground download activation requires a main-frame ref",
+                    ))
+                } else {
+                    let _ = validated
+                        .conn
+                        .call(
+                            Some(&ref_session),
+                            "DOM.scrollIntoViewIfNeeded",
+                            json!({ "backendNodeId": entry.backend_node_id }),
+                        )
+                        .await;
+                    let viewport_point = validated
+                        .conn
+                        .call(
+                            Some(&ref_session),
+                            "DOM.getBoxModel",
+                            json!({ "backendNodeId": entry.backend_node_id }),
+                        )
+                        .await
+                        .ok()
+                        .and_then(|model| quad_center(&model));
+                    let tab_is_visible = validated
+                        .conn
+                        .call(
+                            Some(&ref_session),
+                            "Runtime.evaluate",
+                            json!({
+                                "expression": "document.visibilityState === 'visible'",
+                                "returnByValue": true,
+                                "awaitPromise": false
+                            }),
+                        )
+                        .await
+                        .ok()
+                        .and_then(|result| result.pointer("/result/value").and_then(Value::as_bool))
+                        .unwrap_or(false);
+                    let screen_point = if tab_is_visible {
+                        match viewport_point {
+                            Some((x, y)) => validated
+                                .conn
+                                .call(Some(&ref_session), "Page.getLayoutMetrics", json!({}))
+                                .await
+                                .ok()
+                                .and_then(|metrics| {
+                                    viewport_point_to_screen(
+                                        validated.native.bounds,
+                                        &metrics,
+                                        x,
+                                        y,
+                                    )
+                                }),
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let Some((screen_x, screen_y)) = screen_point else {
+                        reset_download_behavior(&validated.conn).await;
+                        return BrowserRefusal::new(
+                            BrowserRefusalCode::BrowserInputTrustUnavailable,
+                            "the exact main-frame download ref is not visibly native-activatable",
+                        )
+                        .to_tool_result();
+                    };
+                    if let Some((viewport_x, viewport_y)) = viewport_point {
+                        self.engine
+                            .visualize_browser_action(
+                                &session,
+                                &validated,
+                                &ref_session,
+                                viewport_x,
+                                viewport_y,
+                                BrowserVisualActionKind::Click,
+                            )
+                            .await;
+                    }
+                    self.engine
+                        .platform
+                        .activate_browser_point_with_native_input(NativeBrowserActivationRequest {
+                            pid: validated.native.pid,
+                            window_id: validated.native.window_id,
+                            screen_x,
+                            screen_y,
+                        })
+                        .await
+                }
+            }
         };
         if let Err(refusal) = trigger {
             reset_download_behavior(&validated.conn).await;
@@ -634,6 +730,7 @@ impl Tool for BrowserDownloadTool {
                             "delivery_mode": match mode {
                                 DownloadDeliveryMode::Background => "background",
                                 DownloadDeliveryMode::Foreground => "foreground",
+                                DownloadDeliveryMode::NativeForeground => "native_foreground",
                             }
                         }))
                     }
@@ -764,6 +861,10 @@ mod tests {
             delivery_mode(&json!({ "delivery_mode": "foreground" })).unwrap(),
             DownloadDeliveryMode::Foreground
         );
+        assert_eq!(
+            delivery_mode(&json!({ "delivery_mode": "native_foreground" })).unwrap(),
+            DownloadDeliveryMode::NativeForeground
+        );
         assert!(delivery_mode(&json!({ "delivery_mode": "auto" })).is_err());
         assert!(delivery_mode(&json!({ "delivery_mode": true })).is_err());
     }
@@ -772,7 +873,10 @@ mod tests {
     fn schema_declares_background_default_and_explicit_foreground_rung() {
         let schema = download_delivery_mode_schema();
         assert_eq!(schema["default"], "background");
-        assert_eq!(schema["enum"], json!(["background", "foreground"]));
+        assert_eq!(
+            schema["enum"],
+            json!(["background", "foreground", "native_foreground"])
+        );
     }
 
     #[cfg(target_os = "windows")]

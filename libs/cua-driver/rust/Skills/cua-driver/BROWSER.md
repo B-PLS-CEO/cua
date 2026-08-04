@@ -382,7 +382,12 @@ If a current ref's provider handler requires a trusted event, re-snapshot and
 retry only after explicit approval with `delivery_mode:"foreground"`. That
 rung uses trusted CDP Input, may visibly activate a standalone browser, and is
 bound into both the exact browser-resource and file-transfer approval scopes;
-the same download-event and contained-file receipt remains mandatory.
+the same download-event and contained-file receipt remains mandatory. If the
+provider still converts that event into navigation, `native_foreground` is the
+final explicit rung: it requires a visible main-frame ref, maps its live CDP
+box through current layout/native-window geometry, and uses the platform's
+guarded native click while briefly foregrounding that exact window. It never
+accepts navigation as download evidence and has no automatic fallback.
 
 ## Browser chrome and native fallbacks
 

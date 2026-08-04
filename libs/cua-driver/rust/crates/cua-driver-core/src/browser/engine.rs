@@ -187,7 +187,7 @@ pub(crate) struct ValidatedTab {
     pub cdp_session: String,
 }
 
-fn viewport_point_to_screen(
+pub(crate) fn viewport_point_to_screen(
     native: Rect,
     metrics: &Value,
     viewport_x: f64,
