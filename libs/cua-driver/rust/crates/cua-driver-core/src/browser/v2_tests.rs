@@ -1974,7 +1974,7 @@ async fn protected_browser_scope_reproves_live_origin_and_omits_sensitive_url_te
             "tab_id": tab,
             "session": SESSION,
             "ref": "sem_exact_download",
-            "delivery_mode": "foreground",
+            "delivery_mode": "native_foreground",
         }),
         "browser_download",
     )
@@ -1983,7 +1983,7 @@ async fn protected_browser_scope_reproves_live_origin_and_omits_sensitive_url_te
     .unwrap();
     assert_eq!(download["action_class"], "file_transfer");
     assert_eq!(download["ref"], "sem_exact_download");
-    assert_eq!(download["delivery_mode"], "foreground");
+    assert_eq!(download["delivery_mode"], "native_foreground");
     assert_eq!(download["live_origin"], "https://fixture.test");
 
     f.state.lock().unwrap().main_url = "https://bank.example/transfer?secret=one-time-token".into();

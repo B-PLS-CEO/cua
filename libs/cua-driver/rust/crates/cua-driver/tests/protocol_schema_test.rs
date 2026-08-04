@@ -128,6 +128,12 @@ fn tools_list_schema_shape() {
             enum_contains(delivery, "background") && enum_contains(delivery, "foreground"),
             "{tool}.delivery_mode should advertise background and foreground: {delivery:?}"
         );
+        if *tool == "browser_download" {
+            assert!(
+                enum_contains(delivery, "native_foreground"),
+                "browser_download.delivery_mode should advertise its explicit native rung: {delivery:?}"
+            );
+        }
     }
     let schema_tools: BTreeSet<&str> = tools
         .iter()

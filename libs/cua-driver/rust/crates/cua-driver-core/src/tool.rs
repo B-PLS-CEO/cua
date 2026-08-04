@@ -1803,17 +1803,20 @@ impl ToolRegistry {
                 let destination =
                     canonical_existing_directory(required_path_arg(args, "destination_root")?)?;
                 args["destination_root"] = Value::String(destination.clone());
-                let delivery_mode = match args.get("delivery_mode") {
-                    None => "background",
-                    Some(Value::String(mode)) if mode == "background" || mode == "foreground" => {
-                        mode.as_str()
-                    }
-                    _ => {
-                        return Err(ToolResult::error(
-                            "delivery_mode must be background or foreground",
-                        ))
-                    }
-                };
+                let delivery_mode =
+                    match args.get("delivery_mode") {
+                        None => "background",
+                        Some(Value::String(mode))
+                            if mode == "background"
+                                || mode == "foreground"
+                                || mode == "native_foreground" =>
+                        {
+                            mode.as_str()
+                        }
+                        _ => return Err(ToolResult::error(
+                            "delivery_mode must be background, foreground, or native_foreground",
+                        )),
+                    };
                 (
                     serde_json::json!({
                         "kind": "browser_download",
@@ -1824,7 +1827,9 @@ impl ToolRegistry {
                         "direction": "browser_to_local",
                         "canonical_destination_root": destination,
                     }),
-                    if delivery_mode == "foreground" {
+                    if delivery_mode == "native_foreground" {
+                        "Allow Cua to briefly foreground this exact browser window, deliver one native click to this exact control, and download one file to the exact destination directory".to_owned()
+                    } else if delivery_mode == "foreground" {
                         "Allow Cua to visibly activate this exact browser control and download one file to the exact destination directory".to_owned()
                     } else {
                         "Allow Cua to download one file from this browser tab to the exact destination directory".to_owned()
