@@ -187,6 +187,86 @@ pub(crate) struct ValidatedTab {
     pub cdp_session: String,
 }
 
+/// Slack, in device-independent pixels, allowed when proving that Chromium's
+/// content box fits inside the window server's window rect. It absorbs
+/// sub-pixel rounding on both sides of that comparison and nothing else.
+const VIEWPORT_GEOMETRY_TOLERANCE_DIP: f64 = 1.0;
+
+/// Bounds on a believable CSS→DIP scale. Chromium's browser zoom range is
+/// 25%–500%; a factor outside it is not a zoom this mapping can reason
+/// about, so the point is refused rather than multiplied by a nonsense
+/// number.
+const MIN_CSS_TO_DIP_SCALE: f64 = 0.25;
+const MAX_CSS_TO_DIP_SCALE: f64 = 5.0;
+
+/// How far the visual viewport may be pinch-scaled away from the layout
+/// viewport before a layout-space point stops being a viewport offset.
+const MAX_VISUAL_VIEWPORT_SCALE_DRIFT: f64 = 0.01;
+
+/// How far, in CSS pixels, the visual viewport may be displaced from the
+/// layout viewport for the same reason.
+const MAX_VISUAL_VIEWPORT_OFFSET_DRIFT_CSS: f64 = 1.0;
+
+fn finite_number(value: &Value, field: &str) -> Option<f64> {
+    value
+        .get(field)
+        .and_then(Value::as_f64)
+        .filter(|number| number.is_finite())
+}
+
+/// The measured ratio between a page's CSS pixels and the device-independent
+/// pixels that window rects are expressed in.
+///
+/// Chromium reports this as `zoom` on the CSS viewport structures of
+/// `Page.getLayoutMetrics`: "page zoom factor (CSS to device independent
+/// pixels ratio)". It is the browser's own measurement of the browser zoom
+/// level, with the display's device scale factor already divided back out,
+/// so it is the only field in that payload that answers this question:
+///
+/// - the `css*` fields are CSS pixels (the display's backing scale and the
+///   browser zoom are both divided out of them);
+/// - the deprecated non-`css` fields are *physical device* pixels, i.e. CSS
+///   multiplied by the whole layout zoom factor (backing scale × browser
+///   zoom) — so their ratio to the CSS fields is the device pixel ratio, not
+///   this scale, and it must not be substituted for it;
+/// - window rects — CDP's `Browser.getWindowForTarget` and every platform
+///   adapter's [`NativeWindowInfo::bounds`] — are device-independent pixels,
+///   which equal CSS pixels only while the browser zoom is exactly 100%.
+///
+/// Returns `None` when the browser did not report a usable factor: an
+/// unmeasurable scale is a refusal, never an assumed 1:1.
+fn css_to_dip_scale(metrics: &Value, viewport: &Value) -> Option<f64> {
+    let zoom = finite_number(viewport, "zoom")
+        .or_else(|| finite_number(metrics.get("cssVisualViewport")?, "zoom"))?;
+    (MIN_CSS_TO_DIP_SCALE..=MAX_CSS_TO_DIP_SCALE)
+        .contains(&zoom)
+        .then_some(zoom)
+}
+
+/// Map a main-frame CSS-pixel viewport point onto the screen point that the
+/// window server would put under a cursor there.
+///
+/// Two different unit spaces meet here and the conversion between them is
+/// measured, never assumed:
+///
+/// - `viewport_x`/`viewport_y` and the layout metrics are **CSS pixels**;
+/// - `native` is **device-independent pixels** in the normalized, top-left
+///   origin space every platform adapter must produce (see [`Rect`]) — the
+///   same space Quartz global display coordinates already use on macOS, so
+///   no AppKit bottom-left inversion happens at this seam, and a window on a
+///   display left of or above the primary one legitimately carries negative
+///   coordinates.
+///
+/// The two coincide only at 100% browser zoom. Everywhere else — most
+/// visibly on a Retina window whose page is zoomed, where the CSS viewport
+/// reads *wider* than the window that contains it — conflating them yields a
+/// negative inset and refuses every activation.
+///
+/// Chromium centers the content box horizontally in the window and stacks
+/// its browser chrome above it. Geometry that contradicts that layout, a
+/// point outside the viewport it came from, a window whose rect is not
+/// measurable, or a scale the browser did not report is refused: a wrong
+/// point is worse than no point, for both a synthetic click and a cursor.
 pub(crate) fn viewport_point_to_screen(
     native: Rect,
     metrics: &Value,
@@ -196,14 +276,24 @@ pub(crate) fn viewport_point_to_screen(
     if !viewport_x.is_finite() || !viewport_y.is_finite() {
         return None;
     }
+    // An unmeasurable or degenerate window rect cannot anchor anything.
+    // Guarding the origin matters as much as the size: a non-finite origin
+    // silently propagates into the returned point.
+    if !native.x.is_finite()
+        || !native.y.is_finite()
+        || !native.width.is_finite()
+        || !native.height.is_finite()
+        || native.width <= 0.0
+        || native.height <= 0.0
+    {
+        return None;
+    }
     let viewport = metrics
         .get("cssVisualViewport")
         .or_else(|| metrics.get("cssLayoutViewport"))?;
-    let width = viewport.get("clientWidth")?.as_f64()?;
-    let height = viewport.get("clientHeight")?.as_f64()?;
-    if !width.is_finite()
-        || !height.is_finite()
-        || width <= 0.0
+    let width = finite_number(viewport, "clientWidth")?;
+    let height = finite_number(viewport, "clientHeight")?;
+    if width <= 0.0
         || height <= 0.0
         || viewport_x < 0.0
         || viewport_y < 0.0
@@ -213,23 +303,51 @@ pub(crate) fn viewport_point_to_screen(
         return None;
     }
 
-    // CDP viewport coordinates and native/CDP window bounds are all DIPs.
-    // Chromium centers the content viewport horizontally and places its
-    // browser chrome above it. A negative inset means the geometry is not
-    // trustworthy enough for visual feedback, so skip rather than mislead.
-    let horizontal_inset = (native.width - width) / 2.0;
-    let top_inset = native.height - height;
+    // Under pinch zoom the visual viewport is a scaled subrect of the layout
+    // viewport, so a layout-space point is no longer a viewport offset and
+    // this mapping does not model the difference. Refuse only on a reported
+    // divergence — the fields are absent from `cssLayoutViewport` entirely.
+    if let Some(scale) = finite_number(viewport, "scale") {
+        if (scale - 1.0).abs() > MAX_VISUAL_VIEWPORT_SCALE_DRIFT {
+            return None;
+        }
+    }
+    for field in ["offsetX", "offsetY"] {
+        if let Some(offset) = finite_number(viewport, field) {
+            if offset.abs() > MAX_VISUAL_VIEWPORT_OFFSET_DRIFT_CSS {
+                return None;
+            }
+        }
+    }
+
+    let scale = css_to_dip_scale(metrics, viewport)?;
+    // Convert the content box out of CSS pixels and into the window's own
+    // device-independent space before comparing the two.
+    let content_width = width * scale;
+    let content_height = height * scale;
+    let horizontal_inset = (native.width - content_width) / 2.0;
+    let top_inset = native.height - content_height;
     if !horizontal_inset.is_finite()
         || !top_inset.is_finite()
-        || horizontal_inset < -1.0
-        || top_inset < -1.0
+        || horizontal_inset < -VIEWPORT_GEOMETRY_TOLERANCE_DIP
+        || top_inset < -VIEWPORT_GEOMETRY_TOLERANCE_DIP
     {
         return None;
     }
-    Some((
-        native.x + horizontal_inset.max(0.0) + viewport_x,
-        native.y + top_inset.max(0.0) + viewport_y,
-    ))
+    let x = native.x + horizontal_inset.max(0.0) + viewport_x * scale;
+    let y = native.y + top_inset.max(0.0) + viewport_y * scale;
+    if !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+    // Whatever the arithmetic produced, it has to be a point on this window.
+    if x < native.x - VIEWPORT_GEOMETRY_TOLERANCE_DIP
+        || x > native.x + native.width + VIEWPORT_GEOMETRY_TOLERANCE_DIP
+        || y < native.y - VIEWPORT_GEOMETRY_TOLERANCE_DIP
+        || y > native.y + native.height + VIEWPORT_GEOMETRY_TOLERANCE_DIP
+    {
+        return None;
+    }
+    Some((x, y))
 }
 
 /// Whether a CDP error is Chromium's "method not implemented" shape.
@@ -2752,6 +2870,8 @@ fn collect_interactive(
 mod tests {
     use super::*;
 
+    /// An unzoomed page: one CSS pixel is one device-independent pixel, so
+    /// the mapping is the identity scale it has always been.
     #[test]
     fn viewport_point_maps_below_browser_chrome_in_live_native_bounds() {
         let point = viewport_point_to_screen(
@@ -2759,7 +2879,9 @@ mod tests {
             &json!({
                 "cssVisualViewport": {
                     "clientWidth": 980.0,
-                    "clientHeight": 700.0
+                    "clientHeight": 700.0,
+                    "scale": 1.0,
+                    "zoom": 1.0
                 }
             }),
             240.0,
@@ -2771,20 +2893,230 @@ mod tests {
     #[test]
     fn viewport_point_refuses_untrustworthy_or_out_of_view_geometry() {
         let native = Rect::new(0.0, 0.0, 800.0, 600.0);
+        // Content wider than the window it is supposed to live inside.
         assert_eq!(
             viewport_point_to_screen(
                 native,
-                &json!({"cssVisualViewport":{"clientWidth":900.0,"clientHeight":600.0}}),
+                &json!({"cssVisualViewport":{"clientWidth":900.0,"clientHeight":600.0,"zoom":1.0}}),
                 10.0,
                 10.0,
             ),
             None
         );
+        // A point past the right edge of the viewport it came from.
         assert_eq!(
             viewport_point_to_screen(
                 native,
-                &json!({"cssVisualViewport":{"clientWidth":800.0,"clientHeight":500.0}}),
+                &json!({"cssVisualViewport":{"clientWidth":800.0,"clientHeight":500.0,"zoom":1.0}}),
                 801.0,
+                10.0,
+            ),
+            None
+        );
+    }
+
+    /// Live metrics from a Retina window whose page is zoomed to 90%: CSS
+    /// pixels are 0.9 device-independent pixels, so the CSS viewport reads
+    /// *wider* than the window rect. Treating the two as one unit space
+    /// produced a negative horizontal inset and refused every activation.
+    fn zoomed_retina_metrics() -> Value {
+        json!({
+            "cssVisualViewport": {
+                "offsetX": 0.0,
+                "offsetY": 0.0,
+                "pageX": 0.0,
+                "pageY": 0.0,
+                "clientWidth": 1337.777_832_031_25_f64,
+                "clientHeight": 723.333_374_023_437_5_f64,
+                "scale": 1.0,
+                "zoom": 0.9
+            }
+        })
+    }
+
+    #[test]
+    fn viewport_point_maps_a_zoomed_retina_window_instead_of_refusing() {
+        let native = Rect::new(0.0, 25.0, 1204.0, 794.0);
+        let metrics = zoomed_retina_metrics();
+        // Center of the CSS viewport.
+        let (x, y) = viewport_point_to_screen(
+            native,
+            &metrics,
+            668.888_916_015_625,
+            361.666_687_011_718_75,
+        )
+        .expect("a zoomed Retina window must still map to a screen point");
+
+        // CSS pixels scale into the window's device-independent space:
+        // 1337.78 css * 0.9 == the window's 1204 dip width, so the content
+        // spans the window and the only inset is the browser chrome on top.
+        assert!(
+            (x - 602.0).abs() < 0.01,
+            "expected the horizontal center of the content area, got {x}"
+        );
+        assert!(
+            (y - 493.5).abs() < 0.01,
+            "expected the vertical center below 143 dip of browser chrome, got {y}"
+        );
+        // And it must land inside the window it was derived from.
+        assert!(
+            x >= native.x && x <= native.x + native.width,
+            "{x} escaped the window"
+        );
+        assert!(
+            y >= native.y && y <= native.y + native.height,
+            "{y} escaped the window"
+        );
+    }
+
+    #[test]
+    fn viewport_point_maps_a_zoomed_window_on_a_negative_origin_display() {
+        // A display left of the primary one: the window origin is negative
+        // in the normalized top-left space, which is coherent, not corrupt.
+        let native = Rect::new(-1204.0, -300.0, 1204.0, 794.0);
+        let (x, y) = viewport_point_to_screen(native, &zoomed_retina_metrics(), 0.0, 0.0)
+            .expect("a negative window origin is a real multi-display layout");
+        assert!((x - -1204.0).abs() < 0.01, "{x}");
+        assert!((y - -157.0).abs() < 0.01, "{y}");
+    }
+
+    #[test]
+    fn viewport_point_refuses_when_the_css_to_dip_scale_is_unknown() {
+        // Geometry that *looks* coherent when CSS pixels are assumed to be
+        // device-independent pixels. Without a measured scale the two unit
+        // spaces cannot be told apart, and assuming 1:1 is exactly the
+        // guess that mis-aims a click on any zoomed window.
+        let native = Rect::new(0.0, 25.0, 1204.0, 794.0);
+        assert_eq!(
+            viewport_point_to_screen(
+                native,
+                &json!({
+                    "cssVisualViewport": {
+                        "clientWidth": 1204.0,
+                        "clientHeight": 651.0
+                    }
+                }),
+                10.0,
+                10.0,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn viewport_point_refuses_an_implausible_or_malformed_scale() {
+        let native = Rect::new(0.0, 0.0, 1000.0, 800.0);
+        let with_zoom = |zoom: Value| {
+            json!({
+                "cssVisualViewport": {
+                    "clientWidth": 980.0,
+                    "clientHeight": 700.0,
+                    "zoom": zoom
+                }
+            })
+        };
+        for zoom in [
+            json!(0.0),
+            json!(-1.0),
+            json!(1000.0),
+            json!(0.01),
+            json!("1.0"),
+            json!(null),
+        ] {
+            assert_eq!(
+                viewport_point_to_screen(native, &with_zoom(zoom.clone()), 10.0, 10.0),
+                None,
+                "zoom {zoom} must not be accepted as a scale"
+            );
+        }
+    }
+
+    #[test]
+    fn viewport_point_refuses_non_finite_or_missing_metrics() {
+        let native = Rect::new(0.0, 0.0, 1000.0, 800.0);
+        // No viewport at all.
+        assert_eq!(
+            viewport_point_to_screen(native, &json!({}), 10.0, 10.0),
+            None
+        );
+        // Present, but missing a dimension.
+        assert_eq!(
+            viewport_point_to_screen(
+                native,
+                &json!({"cssVisualViewport":{"clientWidth":980.0,"zoom":1.0}}),
+                10.0,
+                10.0,
+            ),
+            None
+        );
+        // Present and non-numeric.
+        assert_eq!(
+            viewport_point_to_screen(
+                native,
+                &json!({"cssVisualViewport":{"clientWidth":"980","clientHeight":700.0,"zoom":1.0}}),
+                10.0,
+                10.0,
+            ),
+            None
+        );
+        // Non-finite request coordinates.
+        assert_eq!(
+            viewport_point_to_screen(
+                native,
+                &json!({"cssVisualViewport":{"clientWidth":980.0,"clientHeight":700.0,"zoom":1.0}}),
+                f64::NAN,
+                10.0,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn viewport_point_refuses_non_finite_or_degenerate_native_bounds() {
+        let metrics = json!({
+            "cssVisualViewport": {"clientWidth": 980.0, "clientHeight": 700.0, "zoom": 1.0}
+        });
+        for native in [
+            Rect::new(f64::NAN, 0.0, 1000.0, 800.0),
+            Rect::new(0.0, f64::INFINITY, 1000.0, 800.0),
+            Rect::new(0.0, 0.0, f64::NAN, 800.0),
+            // A window the window server could not measure at all.
+            Rect::new(0.0, 0.0, 0.0, 0.0),
+            Rect::new(0.0, 0.0, -1000.0, 800.0),
+        ] {
+            assert_eq!(
+                viewport_point_to_screen(native, &metrics, 10.0, 10.0),
+                None,
+                "native bounds {native:?} are not measurable geometry"
+            );
+        }
+    }
+
+    #[test]
+    fn viewport_point_refuses_a_pinch_zoomed_or_displaced_visual_viewport() {
+        let native = Rect::new(0.0, 0.0, 1000.0, 800.0);
+        // Pinch zoom: the visual viewport is a subrect of the layout
+        // viewport, so a layout-space point is not a viewport offset.
+        assert_eq!(
+            viewport_point_to_screen(
+                native,
+                &json!({"cssVisualViewport":{
+                    "clientWidth":490.0,"clientHeight":350.0,"scale":2.0,"zoom":1.0
+                }}),
+                10.0,
+                10.0,
+            ),
+            None
+        );
+        // Displaced visual viewport, same reason.
+        assert_eq!(
+            viewport_point_to_screen(
+                native,
+                &json!({"cssVisualViewport":{
+                    "clientWidth":980.0,"clientHeight":700.0,
+                    "offsetX":120.0,"offsetY":0.0,"scale":1.0,"zoom":1.0
+                }}),
+                10.0,
                 10.0,
             ),
             None

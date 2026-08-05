@@ -528,12 +528,19 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                 &[90, 100],
                 &[[0.0, 0.0, 300.0, 100.0], [10.0, 10.0, 120.0, 30.0]],
             )),
+            // Shaped like Chromium's own reply: the CSS viewport carries the
+            // pinch scale and the browser zoom factor that converts CSS
+            // pixels into the device-independent pixels window rects use.
             "Page.getLayoutMetrics" => MockReply::ok(json!({
                 "cssVisualViewport": {
+                    "offsetX": 0.0,
+                    "offsetY": 0.0,
                     "pageX": 0.0,
                     "pageY": 0.0,
                     "clientWidth": st.viewport_css_width,
-                    "clientHeight": st.viewport_css_height
+                    "clientHeight": st.viewport_css_height,
+                    "scale": 1.0,
+                    "zoom": 1.0
                 }
             })),
             "Runtime.evaluate"
