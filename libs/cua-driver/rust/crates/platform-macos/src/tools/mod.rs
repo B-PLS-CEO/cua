@@ -158,6 +158,12 @@ impl ZoomContext {
 ///   agent's vision-driven last resort — and the only way `click` reaches a
 ///   foreground rung. Orthogonal to addressing (`element_index` vs `x/y`, which
 ///   selects AX vs pixel).
+///
+/// The shared contract carries a third rung, `native_foreground`. macOS
+/// implements it only for `browser_download`, whose native activation lives in
+/// [`crate::browser::platform`]; the registry refuses it for these input tools
+/// before dispatch (see `cua_driver_core::tool`) so it is never resolved to a
+/// lower rung here.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum DeliveryMode {
     #[default]

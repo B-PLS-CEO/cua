@@ -12,7 +12,7 @@ use cua_driver_core::browser::existing_profile_setup_descriptor;
 use cua_driver_core::browser::platform::{
     BrowserConsentOutcome, BrowserConsentRequest, BrowserPlatform, BrowserVisualAction,
     BrowserVisualActionKind, ExistingProfileSetupOutcome, ExistingProfileSetupRequest,
-    PrepareAction, PrepareOutcome, PrepareRequest,
+    NativeBrowserActivationRequest, PrepareAction, PrepareOutcome, PrepareRequest,
 };
 use cua_driver_core::browser::refusal::{BrowserRefusal, BrowserRefusalCode};
 use cua_driver_core::browser::types::{
@@ -811,6 +811,32 @@ where
 
 #[async_trait]
 impl BrowserPlatform for WindowsBrowserPlatform {
+    /// Refuse the shared ladder's `native_foreground` rung explicitly.
+    ///
+    /// Windows has no guarded native-input path for an exact browser point:
+    /// this adapter never mints the foreground/HID activation window that the
+    /// rung requires, and `input::delivery` already refuses posted input to a
+    /// background Chromium renderer outright. Core's default also refuses, but
+    /// stating the Windows limitation here keeps the adapter honest about its
+    /// own contract — and forecloses "fixing" the refusal by falling back to
+    /// the CDP `foreground` rung, which would report a native click that never
+    /// happened.
+    async fn activate_browser_point_with_native_input(
+        &self,
+        _request: NativeBrowserActivationRequest,
+    ) -> Result<(), BrowserRefusal> {
+        Err(refusal(
+            BrowserRefusalCode::BrowserInputTrustUnavailable,
+            "delivery_mode \"native_foreground\" is not implemented on Windows: this adapter has \
+             no guarded native-input path that can deliver a real pointer event to an exact \
+             browser point, so the native rung is refused rather than downgraded",
+        )
+        .with_detail(serde_json::json!({
+            "unsupported_delivery_mode": "native_foreground",
+            "supported_delivery_mode": ["background", "foreground"]
+        })))
+    }
+
     async fn visualize_browser_action(&self, action: BrowserVisualAction) {
         if action.session.is_empty()
             || action.cdp_target_id.is_empty()
@@ -1313,6 +1339,40 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// The Windows adapter must answer the shared ladder's native rung with an
+    /// explicit refusal that names the mode — never `Ok(())`, and never a
+    /// quiet fall-through to the CDP `foreground` rung, which would report a
+    /// native click this adapter cannot deliver.
+    #[tokio::test]
+    async fn native_foreground_activation_is_refused_explicitly_on_windows() {
+        let refusal = WindowsBrowserPlatform::default()
+            .activate_browser_point_with_native_input(NativeBrowserActivationRequest {
+                pid: 4321,
+                window_id: 9,
+                screen_x: 100.0,
+                screen_y: 200.0,
+            })
+            .await
+            .expect_err("Windows has no native browser-activation path");
+
+        assert_eq!(
+            refusal.code,
+            BrowserRefusalCode::BrowserInputTrustUnavailable
+        );
+        assert!(
+            refusal.message.contains("native_foreground") && refusal.message.contains("Windows"),
+            "the refusal must name the mode and the platform: {}",
+            refusal.message
+        );
+        let detail = refusal.detail.as_ref().expect("machine-readable detail");
+        assert_eq!(detail["unsupported_delivery_mode"], "native_foreground");
+        assert_eq!(
+            detail["supported_delivery_mode"],
+            serde_json::json!(["background", "foreground"]),
+            "the native rung must not be offered as its own substitute"
+        );
+    }
 
     #[test]
     fn browser_cursor_tracker_shows_only_the_active_tabs_session_per_window() {

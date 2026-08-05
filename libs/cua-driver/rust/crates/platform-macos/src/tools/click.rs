@@ -187,11 +187,11 @@ fn def() -> &'static ToolDef {
                     "type": "string",
                     "description": "Optional file path. When set on a pixel-addressed click, captures a fresh screenshot, draws a red crosshair at (x, y), and writes the PNG. Use to verify coordinate spaces. Requires window_id; incompatible with from_zoom."
                 },
-                "delivery_mode": {
-                    "type": "string",
-                    "enum": ["background", "foreground"],
-                    "description": "Best-effort-background ladder rung (default \"background\"). \"background\": perform the AX action or post the CGEvent without fronting. \"foreground\": briefly front the window, act, let transient UI settle, then restore the prior frontmost app. Requires window_id. Modified clicks require \"foreground\" so macOS observes physical modifier-key state. A generic click has no independent postcondition read-back, except selection of list-like AX rows whose AXSelected state can be confirmed; otherwise confirm the effect from a fresh state snapshot. Use the agent loop: background AX (element_index) → snapshot → background pixel (x/y) → snapshot → delivery_mode:\"foreground\"."
-                },
+                // Shape from the shared canon so the ladder cannot fork per
+                // platform; the prose stays click-specific.
+                "delivery_mode": cua_driver_core::tool_schema::delivery_mode_schema_with(
+                    "Best-effort-background ladder rung (default \"background\"). \"background\": perform the AX action or post the CGEvent without fronting. \"foreground\": briefly front the window, act, let transient UI settle, then restore the prior frontmost app. Requires window_id. Modified clicks require \"foreground\" so macOS observes physical modifier-key state. A generic click has no independent postcondition read-back, except selection of list-like AX rows whose AXSelected state can be confirmed; otherwise confirm the effect from a fresh state snapshot. Use the agent loop: background AX (element_index) → snapshot → background pixel (x/y) → snapshot → delivery_mode:\"foreground\". \"native_foreground\" belongs to the shared ladder but is always refused here: it is implemented only for browser_download, so the request is answered rather than downgraded."
+                ),
                 "scope": {
                     "type": "string",
                     "enum": ["window", "desktop"],

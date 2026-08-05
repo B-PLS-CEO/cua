@@ -2071,6 +2071,24 @@ impl Tool for BrowserTypeTool {
 
 // ── browser_dialog ──────────────────────────────────────────────────────────
 
+/// `browser_dialog`'s rung of the shared delivery ladder. The SHAPE comes from
+/// the cross-platform canon so the third rung cannot drift out of this tool's
+/// enum; the prose and the `background` default stay dialog-specific. This tool
+/// never honours `native_foreground` on any platform — a page-owned JavaScript
+/// modal is resolved through CDP and has no exact screen point to click — so it
+/// refuses that rung explicitly in `invoke`.
+fn dialog_delivery_mode_schema() -> Value {
+    let mut schema = crate::tool_schema::delivery_mode_schema_with(
+        "Requested foreground posture for accept/dismiss. Linux Chromium \
+         requires foreground; inspect is read-only. \"native_foreground\" is \
+         part of the shared ladder but is always refused here: a page-owned \
+         JavaScript modal is resolved through CDP, not through native input at \
+         a screen point.",
+    );
+    schema["default"] = json!("background");
+    schema
+}
+
 pub struct BrowserDialogTool {
     def: ToolDef,
     engine: Arc<BrowserEngine>,
@@ -2091,12 +2109,7 @@ impl BrowserDialogTool {
                         "action": { "type": "string", "enum": ["inspect", "accept", "dismiss"] },
                         "dialog_id": { "type": "string", "description": "Opaque current dialog generation returned by action=inspect." },
                         "prompt_text": { "type": "string", "description": "Sensitive response text, valid only when accepting a prompt dialog." },
-                        "delivery_mode": {
-                            "type": "string",
-                            "enum": ["background", "foreground"],
-                            "default": "background",
-                            "description": "Requested foreground posture for accept/dismiss. Linux Chromium requires foreground; inspect is read-only."
-                        }
+                        "delivery_mode": dialog_delivery_mode_schema()
                     },
                     "required": ["target_id", "tab_id", "action"],
                     "additionalProperties": true
@@ -2162,6 +2175,21 @@ impl Tool for BrowserDialogTool {
         let delivery_mode = args
             .opt_str("delivery_mode")
             .unwrap_or_else(|| "background".into());
+        if delivery_mode == "native_foreground" {
+            // The rung is a legitimate value of the shared ladder, so it is
+            // answered rather than parsed away: this tool has no native
+            // activation point on ANY platform, and silently resolving it to
+            // background or foreground would misreport what was delivered.
+            return BrowserRefusal::new(
+                BrowserRefusalCode::BrowserInputTrustUnavailable,
+                "browser_dialog cannot honour delivery_mode \"native_foreground\": a page-owned JavaScript modal is resolved through CDP and has no exact screen point to click natively",
+            )
+            .with_detail(json!({
+                "unsupported_delivery_mode": "native_foreground",
+                "supported_delivery_mode": ["background", "foreground"]
+            }))
+            .to_tool_result();
+        }
         if !matches!(delivery_mode.as_str(), "background" | "foreground") {
             return ToolResult::error("delivery_mode must be background or foreground");
         }

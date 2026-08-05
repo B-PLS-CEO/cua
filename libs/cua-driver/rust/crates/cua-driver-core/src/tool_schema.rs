@@ -38,8 +38,20 @@ pub fn session_schema() -> Value {
 /// `delivery_mode` — the best-effort-background ladder rung. The prose varies by
 /// tool (the surface it injects through differs), so callers may pass their own
 /// `description`; the shape is fixed here.
+///
+/// The ladder has three rungs. `native_foreground` is a cross-platform contract
+/// *value*, not a per-platform parameter name: forking the parameter per
+/// platform is the exact class of divergence this module exists to prevent. A
+/// tool or backend that cannot deliver that rung refuses it explicitly — see
+/// `tool::native_delivery_rung_refusal` for the desktop ladder and
+/// `BrowserPlatform::activate_browser_point_with_native_input` for the browser
+/// surface — instead of accepting it, downgrading it, or ignoring it.
 pub fn delivery_mode_schema_with(description: &str) -> Value {
-    json!({ "type": "string", "enum": ["background", "foreground"], "description": description })
+    json!({
+        "type": "string",
+        "enum": ["background", "foreground", "native_foreground"],
+        "description": description
+    })
 }
 
 /// `delivery_mode` with the generic, tool-agnostic blurb.
@@ -49,7 +61,12 @@ pub fn delivery_mode_schema() -> Value {
          \"background\": inject without fronting or raising the target — no focus \
          steal. \"foreground\": briefly front the target, act, then restore the \
          prior frontmost — the explicit last resort when a background attempt \
-         didn't land. Re-call with \"foreground\" only for the action that needs it.",
+         didn't land. Re-call with \"foreground\" only for the action that needs it. \
+         \"native_foreground\": front the exact target and deliver real \
+         OS-level input at an exact screen point. Only browser_download \
+         implements that rung, and only where the backend has a guarded native \
+         input path; every other tool and every backend without one refuses it \
+         explicitly rather than downgrading to a lower rung.",
     )
 }
 
@@ -237,6 +254,39 @@ mod tests {
             }
         });
         assert!(shared_schema_violations("click", &tool).is_empty());
+    }
+
+    #[test]
+    fn delivery_mode_canon_carries_all_three_ladder_rungs() {
+        // `native_foreground` is a shared contract value: every platform's
+        // `delivery_mode` advertises it, and the backends that cannot deliver
+        // it refuse explicitly. A two-rung canon would force the tool that DOES
+        // implement it to fork the parameter per platform instead.
+        assert_eq!(
+            structural(&delivery_mode_schema()),
+            json!({
+                "type": "string",
+                "enum": ["background", "foreground", "native_foreground"]
+            })
+        );
+        assert_eq!(
+            shared_param_canonical("delivery_mode"),
+            Some(structural(&delivery_mode_schema_with("any prose at all")))
+        );
+    }
+
+    #[test]
+    fn a_two_rung_delivery_mode_is_flagged_as_drift() {
+        // The regression this test pins: a tool that advertises only the two
+        // old rungs no longer matches the canon and must be reported.
+        let tool = json!({
+            "type": "object",
+            "properties": {
+                "delivery_mode": { "type": "string", "enum": ["background", "foreground"] }
+            }
+        });
+        let v = shared_schema_violations("browser_download", &tool);
+        assert_eq!(v.len(), 1, "a stale two-rung ladder must be flagged: {v:?}");
     }
 
     #[test]

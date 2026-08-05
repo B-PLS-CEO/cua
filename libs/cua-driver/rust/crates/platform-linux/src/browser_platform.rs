@@ -8,7 +8,8 @@ use async_trait::async_trait;
 use cua_driver_core::browser::existing_profile_setup_descriptor;
 use cua_driver_core::browser::platform::{
     BrowserConsentOutcome, BrowserConsentRequest, BrowserPlatform, ExistingProfileSetupOutcome,
-    ExistingProfileSetupRequest, PrepareAction, PrepareOutcome, PrepareRequest,
+    ExistingProfileSetupRequest, NativeBrowserActivationRequest, PrepareAction, PrepareOutcome,
+    PrepareRequest,
 };
 use cua_driver_core::browser::refusal::{BrowserRefusal, BrowserRefusalCode};
 use cua_driver_core::browser::types::{
@@ -390,6 +391,32 @@ async fn browser_websocket_url(port: u16) -> Option<String> {
 impl BrowserPlatform for LinuxBrowserPlatform {
     fn standalone_trusted_input_background_limitation(&self) -> Option<&'static str> {
         Some("Chromium's trusted CDP Input route activates its standalone browser window on Linux")
+    }
+
+    /// Refuse the shared ladder's `native_foreground` rung explicitly.
+    ///
+    /// Linux has no guarded native-input path that can put a real pointer event
+    /// on an exact browser point: X11 background injection cannot address an
+    /// occluded Chromium renderer, and Wayland's security model has no
+    /// per-window targeting at all (see `input::delivery`). Core's default
+    /// already refuses, but this states the concrete Linux limitation instead
+    /// of inheriting a generic one — and makes it impossible to "fix" a future
+    /// refusal by quietly downgrading to the CDP `foreground` rung, which would
+    /// report a native click that never happened.
+    async fn activate_browser_point_with_native_input(
+        &self,
+        _request: NativeBrowserActivationRequest,
+    ) -> Result<(), BrowserRefusal> {
+        Err(refusal(
+            BrowserRefusalCode::BrowserInputTrustUnavailable,
+            "delivery_mode \"native_foreground\" is not implemented on Linux: neither the X11 \
+             nor the Wayland input path can deliver a real pointer event to an exact browser \
+             point, so the native rung is refused rather than downgraded",
+        )
+        .with_detail(serde_json::json!({
+            "unsupported_delivery_mode": "native_foreground",
+            "supported_delivery_mode": ["background", "foreground"]
+        })))
     }
 
     async fn classify_browser(&self, pid: i64) -> Result<BrowserClassification, BrowserRefusal> {
@@ -1055,6 +1082,40 @@ impl BrowserPlatform for LinuxBrowserPlatform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Linux adapter must answer the shared ladder's native rung with an
+    /// explicit refusal that names the mode — never `Ok(())`, and never a
+    /// quiet fall-through to the CDP `foreground` rung, which would report a
+    /// native click Linux cannot deliver.
+    #[tokio::test]
+    async fn native_foreground_activation_is_refused_explicitly_on_linux() {
+        let refusal = LinuxBrowserPlatform::default()
+            .activate_browser_point_with_native_input(NativeBrowserActivationRequest {
+                pid: 4321,
+                window_id: 9,
+                screen_x: 100.0,
+                screen_y: 200.0,
+            })
+            .await
+            .expect_err("Linux has no native browser-activation path");
+
+        assert_eq!(
+            refusal.code,
+            BrowserRefusalCode::BrowserInputTrustUnavailable
+        );
+        assert!(
+            refusal.message.contains("native_foreground") && refusal.message.contains("Linux"),
+            "the refusal must name the mode and the platform: {}",
+            refusal.message
+        );
+        let detail = refusal.detail.as_ref().expect("machine-readable detail");
+        assert_eq!(detail["unsupported_delivery_mode"], "native_foreground");
+        assert_eq!(
+            detail["supported_delivery_mode"],
+            serde_json::json!(["background", "foreground"]),
+            "the native rung must not be offered as its own substitute"
+        );
+    }
 
     #[test]
     fn proc_net_parser_returns_only_loopback_listeners() {

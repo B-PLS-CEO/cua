@@ -389,6 +389,14 @@ box through current layout/native-window geometry, and uses the platform's
 guarded native click while briefly foregrounding that exact window. It never
 accepts navigation as download evidence and has no automatic fallback.
 
+`native_foreground` is one shared cross-platform value, not a per-platform
+parameter, and `browser_download` is the only tool that implements it. A
+platform without a guarded native-input path for an exact browser point refuses
+it with `browser_input_trust_unavailable`, naming the mode; every other tool
+that accepts `delivery_mode` refuses it with `delivery_mode_unsupported`. No
+backend downgrades it to `foreground` or `background` — a refusal is the answer,
+because a lower rung would report a native click that never happened.
+
 ## Browser chrome and native fallbacks
 
 The browser tools operate on page content, not the surrounding native UI. Use
