@@ -238,7 +238,7 @@ from_zoom: set true after a zoom call to auto-translate zoom-image pixel coordin
 - `button` (string, optional): Mouse button. Default: "left" — omit for legacy left-click behaviour. Pixel path uses the matching CGEvent primitive; AX path maps "right" to AXShowMenu and falls back to a pixel middle-click at the element's center for "middle".
 - `count` (integer, optional): Click count (pixel path only). Default 1.
 - `debug_image_out` (string, optional): Optional file path. When set on a pixel-addressed click, captures a fresh screenshot, draws a red crosshair at (x, y), and writes the PNG. Use to verify coordinate spaces. Requires window_id; incompatible with from_zoom.
-- `delivery_mode` (string, optional): Best-effort-background ladder rung (default "background"). "background": perform the AX action or post the CGEvent without fronting. "foreground": briefly front the window, act, let transient UI settle, then restore the prior frontmost app. Requires window_id. Modified clicks require "foreground" so macOS observes physical modifier-key state. A generic click has no independent postcondition read-back, except selection of list-like AX rows whose AXSelected state can be confirmed; otherwise confirm the effect from a fresh state snapshot. Use the agent loop: background AX (element_index) → snapshot → background pixel (x/y) → snapshot → delivery_mode:"foreground".
+- `delivery_mode` (string, optional): Best-effort-background ladder rung (default "background"). "background": perform the AX action or post the CGEvent without fronting. "foreground": briefly front the window, act, let transient UI settle, then restore the prior frontmost app. Requires window_id. Modified clicks require "foreground" so macOS observes physical modifier-key state. A generic click has no independent postcondition read-back, except selection of list-like AX rows whose AXSelected state can be confirmed; otherwise confirm the effect from a fresh state snapshot. Use the agent loop: background AX (element_index) → snapshot → background pixel (x/y) → snapshot → delivery_mode:"foreground". "native_foreground" belongs to the shared ladder but is always refused here: it is implemented only for browser_download, so the request is answered rather than downgraded.
 - `element_index` (integer, optional): Element index from get_window_state. Cua Driver 0.17 requires the matching `snapshot_id` alongside it. Prefer `element_token`, which carries both values.
 - `element_token` (string, optional): Opaque per-snapshot element handle from `structuredContent.elements[].element_token`. If element_index, snapshot_id, or window_id are also supplied they must agree. Returns an explicit stale error once a newer snapshot supersedes it.
 - `from_zoom` (boolean, optional): When true, x and y are in the last zoom image for this pid; driver translates back to full-window coordinates.
@@ -261,7 +261,7 @@ Pixel path (x, y provided): two down/up pairs ~80 ms apart at the given coordina
 
 **Arguments:**
 
-- `delivery_mode` (string, optional): Best-effort-background ladder rung (default "background"). "background": inject without fronting or raising the target — no focus steal. "foreground": briefly front the target, act, then restore the prior frontmost — the explicit last resort when a background attempt didn't land. Re-call with "foreground" only for the action that needs it.
+- `delivery_mode` (string, optional): Best-effort-background ladder rung (default "background"). "background": inject without fronting or raising the target — no focus steal. "foreground": briefly front the target, act, then restore the prior frontmost — the explicit last resort when a background attempt didn't land. Re-call with "foreground" only for the action that needs it. "native_foreground": front the exact target and deliver real OS-level input at an exact screen point. Only browser_download implements that rung, and only where the backend has a guarded native input path; every other tool and every backend without one refuses it explicitly rather than downgrading to a lower rung.
 - `element_index` (integer, optional): Element index from get_window_state. Cua Driver 0.17 requires the matching `snapshot_id` alongside it. Prefer `element_token`, which carries both values.
 - `element_token` (string, optional): Opaque per-snapshot element handle from `structuredContent.elements[].element_token`. If element_index, snapshot_id, or window_id are also supplied they must agree. Returns an explicit stale error once a newer snapshot supersedes it.
 - `pid` (integer, required)
@@ -287,7 +287,7 @@ Exactly one of `element_index` or (`x` AND `y`) must be provided. `pid` always r
 
 **Arguments:**
 
-- `delivery_mode` (string, optional): Best-effort-background ladder rung (default "background"). "background": inject without fronting or raising the target — no focus steal. "foreground": briefly front the target, act, then restore the prior frontmost — the explicit last resort when a background attempt didn't land. Re-call with "foreground" only for the action that needs it.
+- `delivery_mode` (string, optional): Best-effort-background ladder rung (default "background"). "background": inject without fronting or raising the target — no focus steal. "foreground": briefly front the target, act, then restore the prior frontmost — the explicit last resort when a background attempt didn't land. Re-call with "foreground" only for the action that needs it. "native_foreground": front the exact target and deliver real OS-level input at an exact screen point. Only browser_download implements that rung, and only where the backend has a guarded native input path; every other tool and every backend without one refuses it explicitly rather than downgrading to a lower rung.
 - `element_index` (integer, optional): Element index from get_window_state. Cua Driver 0.17 requires the matching `snapshot_id` alongside it. Prefer `element_token`, which carries both values.
 - `element_token` (string, optional): Opaque per-snapshot element handle from `structuredContent.elements[].element_token`. If element_index, snapshot_id, or window_id are also supplied they must agree. Returns an explicit stale error once a newer snapshot supersedes it.
 - `modifier` (array of string, optional): Modifier keys held during the right-click: cmd/shift/option/ctrl. Pixel path only.
@@ -317,7 +317,7 @@ When `from_zoom` is true, coordinates are in the last zoom image for this pid; t
 **Arguments:**
 
 - `button` (string, optional): Mouse button used for the drag. Default: left.
-- `delivery_mode` (string, optional): Best-effort-background ladder rung (default "background"). "background": inject without fronting or raising the target — no focus steal. "foreground": briefly front the target, act, then restore the prior frontmost — the explicit last resort when a background attempt didn't land. Re-call with "foreground" only for the action that needs it.
+- `delivery_mode` (string, optional): Best-effort-background ladder rung (default "background"). "background": inject without fronting or raising the target — no focus steal. "foreground": briefly front the target, act, then restore the prior frontmost — the explicit last resort when a background attempt didn't land. Re-call with "foreground" only for the action that needs it. "native_foreground": front the exact target and deliver real OS-level input at an exact screen point. Only browser_download implements that rung, and only where the backend has a guarded native input path; every other tool and every backend without one refuses it explicitly rather than downgrading to a lower rung.
 - `duration_ms` (integer, optional): Wall-clock duration of the drag path between mouseDown and mouseUp. Default: 500. range: 0–10000
 - `from_x` (number, required): Drag-start X in window-local screenshot pixels. Top-left origin.
 - `from_y` (number, required): Drag-start Y in window-local screenshot pixels. Top-left origin.
@@ -346,7 +346,7 @@ WEB CONTENT (Chromium/WebKit/Electron — browser tabs, Slack, VS Code, X's comp
 **Arguments:**
 
 - `delay_ms` (integer, optional): Milliseconds between characters in the CGEvent fallback path. Default 30. Ignored when the AX path succeeds. range: 0–200
-- `delivery_mode` (string, optional): Best-effort-background ladder rung (default "background"). "background": AX insert, then CGEvent keystrokes if needed — no focus steal; native controls can be confirmed via AXValue read-back, while web-content writes remain effect:"unverifiable". "foreground": briefly front the window, type, restore the prior frontmost — the explicit last resort for focus-sensitive surfaces (e.g. WhatsApp/Catalyst) where background keystrokes don't land. Re-call with "foreground" when a background attempt remains unverifiable and a fresh snapshot shows the text did not appear.
+- `delivery_mode` (string, optional): Best-effort-background ladder rung (default "background"). "background": AX insert, then CGEvent keystrokes if needed — no focus steal; native controls can be confirmed via AXValue read-back, while web-content writes remain effect:"unverifiable". "foreground": briefly front the window, type, restore the prior frontmost — the explicit last resort for focus-sensitive surfaces (e.g. WhatsApp/Catalyst) where background keystrokes don't land. Re-call with "foreground" when a background attempt remains unverifiable and a fresh snapshot shows the text did not appear. "native_foreground" belongs to the shared ladder but is always refused here: it is implemented only for browser_download, so the request is answered rather than downgraded.
 - `element_index` (integer, optional): Element index from get_window_state. Cua Driver 0.17 requires the matching `snapshot_id` alongside it. Prefer `element_token`, which carries both values.
 - `element_token` (string, optional): Opaque per-snapshot element handle from `structuredContent.elements[].element_token`. If element_index, snapshot_id, or window_id are also supplied they must agree. Returns an explicit stale error once a newer snapshot supersedes it.
 - `pid` (integer, optional): Target process ID.
@@ -372,7 +372,7 @@ A key press is never driver-verifiable → effect:"unverifiable"; confirm via sc
 
 **Arguments:**
 
-- `delivery_mode` (string, optional): Best-effort-background ladder rung (default "background"). "background": inject without fronting or raising the target — no focus steal. "foreground": briefly front the target, act, then restore the prior frontmost — the explicit last resort when a background attempt didn't land. Re-call with "foreground" only for the action that needs it.
+- `delivery_mode` (string, optional): Best-effort-background ladder rung (default "background"). "background": inject without fronting or raising the target — no focus steal. "foreground": briefly front the target, act, then restore the prior frontmost — the explicit last resort when a background attempt didn't land. Re-call with "foreground" only for the action that needs it. "native_foreground": front the exact target and deliver real OS-level input at an exact screen point. Only browser_download implements that rung, and only where the backend has a guarded native input path; every other tool and every backend without one refuses it explicitly rather than downgrading to a lower rung.
 - `element_index` (integer, optional): Element index from get_window_state. Cua Driver 0.17 requires the matching `snapshot_id` alongside it. Prefer `element_token`, which carries both values.
 - `element_token` (string, optional): Opaque per-snapshot element handle from `structuredContent.elements[].element_token`. If element_index, snapshot_id, or window_id are also supplied they must agree. Returns an explicit stale error once a newer snapshot supersedes it.
 - `key` (string, required): Key name: return, tab, escape, up, down, etc.
@@ -401,7 +401,7 @@ Recognized modifiers: cmd/command, shift, option/alt, ctrl/control, fn. Non-modi
 
 **Arguments:**
 
-- `delivery_mode` (string, optional): Best-effort-background ladder rung (default "background"). "background": inject without fronting or raising the target — no focus steal. "foreground": briefly front the target, act, then restore the prior frontmost — the explicit last resort when a background attempt didn't land. Re-call with "foreground" only for the action that needs it.
+- `delivery_mode` (string, optional): Best-effort-background ladder rung (default "background"). "background": inject without fronting or raising the target — no focus steal. "foreground": briefly front the target, act, then restore the prior frontmost — the explicit last resort when a background attempt didn't land. Re-call with "foreground" only for the action that needs it. "native_foreground": front the exact target and deliver real OS-level input at an exact screen point. Only browser_download implements that rung, and only where the backend has a guarded native input path; every other tool and every backend without one refuses it explicitly rather than downgrading to a lower rung.
 - `keys` (array of string, required): Modifier(s) and one non-modifier key, e.g. ["cmd", "c"]. items: 2–unbounded
 - `pid` (integer, optional): Target process ID.
 - `scope` (string, optional): Use desktop with no pid/window_id to send the chord to the frontmost application. default: `"window"`
@@ -452,7 +452,7 @@ Mapping: by='page' → larger step; by='line' → smaller step; amount = number 
 
 - `amount` (integer, optional): Pixel-wheel path: number of wheel notches. Keystroke path: number of keystroke repetitions. Default: 3. range: 1–50
 - `by` (string, optional): Scroll granularity. Default: line.
-- `delivery_mode` (string, optional): Best-effort-background ladder rung (default "background"). "background": inject without fronting or raising the target — no focus steal. "foreground": briefly front the target, act, then restore the prior frontmost — the explicit last resort when a background attempt didn't land. Re-call with "foreground" only for the action that needs it.
+- `delivery_mode` (string, optional): Best-effort-background ladder rung (default "background"). "background": inject without fronting or raising the target — no focus steal. "foreground": briefly front the target, act, then restore the prior frontmost — the explicit last resort when a background attempt didn't land. Re-call with "foreground" only for the action that needs it. "native_foreground": front the exact target and deliver real OS-level input at an exact screen point. Only browser_download implements that rung, and only where the backend has a guarded native input path; every other tool and every backend without one refuses it explicitly rather than downgrading to a lower rung.
 - `direction` (string, required): Scroll direction.
 - `element_index` (integer, optional): Element index from get_window_state. Cua Driver 0.17 requires the matching `snapshot_id` alongside it. Prefer `element_token`, which carries both values.
 - `element_token` (string, optional): Opaque per-snapshot element handle from `structuredContent.elements[].element_token`. If element_index, snapshot_id, or window_id are also supplied they must agree. Returns an explicit stale error once a newer snapshot supersedes it.
@@ -917,7 +917,7 @@ Inspect or resolve a page-owned JavaScript alert, confirm, prompt, or beforeunlo
 **Arguments:**
 
 - `action` (string, required)
-- `delivery_mode` (string, optional): Requested foreground posture for accept/dismiss. Linux Chromium requires foreground; inspect is read-only. default: `"background"`
+- `delivery_mode` (string, optional): Requested foreground posture for accept/dismiss. Linux Chromium requires foreground; inspect is read-only. "native_foreground" is part of the shared ladder but is always refused here: a page-owned JavaScript modal is resolved through CDP, not through native input at a screen point. default: `"background"`
 - `dialog_id` (string, optional): Opaque current dialog generation returned by action=inspect.
 - `prompt_text` (string, optional): Sensitive response text, valid only when accepting a prompt dialog.
 - `session` (string, optional): Stable caller-declared session id. Browser targets, tabs, and refs are scoped to this session.
@@ -950,6 +950,7 @@ Trigger one download through an exact live browser ref and save it inside an exp
 
 **Arguments:**
 
+- `delivery_mode` (string, optional): background (default) preserves the existing synthetic DOM activation. foreground explicitly permits trusted CDP Input. native_foreground permits guarded native input at the exact main-frame ref point. Both foreground rungs may visibly activate a standalone browser and require explicit approval. default: `"background"`
 - `destination_root` (string, required): Absolute, existing, canonical directory approved to receive the download.
 - `ref` (string, required): Live page ref whose activation initiates the download.
 - `session` (string, required): Explicit caller session owning the browser capabilities.

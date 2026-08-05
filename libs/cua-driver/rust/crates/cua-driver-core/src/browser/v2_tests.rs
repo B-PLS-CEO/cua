@@ -22,10 +22,11 @@ use super::engine::BrowserEngine;
 use super::mock_cdp::{MockCdpServer, MockEvent, MockHandler, MockReply};
 use super::platform::{
     BrowserConsentOutcome, BrowserConsentRequest, BrowserPlatform, ExistingProfileSetupOutcome,
-    ExistingProfileSetupRequest, PrepareAction, PrepareOutcome, PrepareRequest,
+    ExistingProfileSetupRequest, NativeBrowserActivationRequest, PrepareAction, PrepareOutcome,
+    PrepareRequest,
 };
 use super::pointer::BrowserPointerTool;
-use super::refusal::BrowserRefusal;
+use super::refusal::{BrowserRefusal, BrowserRefusalCode};
 use super::tools::{
     browser_protected_resource_scope, BrowserClickTool, BrowserNavigateTool, BrowserPrepareTool,
     BrowserTypeTool, GetBrowserStateTool,
@@ -2006,6 +2007,62 @@ async fn protected_browser_scope_reproves_live_origin_and_omits_sensitive_url_te
     assert!(
         !second.to_string().contains("one-time-token"),
         "query text must never reach the consent resource"
+    );
+}
+
+/// `native_foreground` is a value of the SHARED delivery ladder, so it reaches
+/// every backend — including the ones with no guarded native-input path.
+///
+/// `FixturePlatform` is such a backend: like the Windows and Linux adapters it
+/// does not deliver the native rung. It must answer the request with an
+/// explicit, typed refusal that names the mode. Returning `Ok(())` (accepting
+/// without clicking) or quietly succeeding through a lower rung would report a
+/// native activation that never happened.
+#[tokio::test]
+async fn a_backend_without_a_native_rung_refuses_native_foreground_activation() {
+    let f = fixture().await;
+
+    let refusal = f
+        .engine
+        .platform
+        .activate_browser_point_with_native_input(NativeBrowserActivationRequest {
+            pid: 1,
+            window_id: 7,
+            screen_x: 120.0,
+            screen_y: 240.0,
+        })
+        .await
+        .expect_err("a backend with no native rung must refuse, never accept");
+
+    assert_eq!(
+        refusal.code,
+        BrowserRefusalCode::BrowserInputTrustUnavailable
+    );
+    assert!(
+        refusal.message.contains("native_foreground"),
+        "the refusal must name the mode the caller asked for: {}",
+        refusal.message
+    );
+    let detail = refusal
+        .detail
+        .as_ref()
+        .expect("the refusal must carry machine-readable detail");
+    assert_eq!(
+        detail["unsupported_delivery_mode"], "native_foreground",
+        "the refusal must say which rung was refused: {detail}"
+    );
+    assert_eq!(
+        detail["supported_delivery_mode"],
+        json!(["background", "foreground"]),
+        "the refusal must not offer the native rung as its own substitute: {detail}"
+    );
+
+    let tool_result = refusal.to_tool_result();
+    let rendered = structured(&tool_result);
+    assert_eq!(rendered["status"], "refused");
+    assert_eq!(
+        rendered["refusal"]["code"],
+        "browser_input_trust_unavailable"
     );
 }
 
