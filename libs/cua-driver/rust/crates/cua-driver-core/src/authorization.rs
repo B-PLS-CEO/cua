@@ -287,6 +287,8 @@ const FILE_TRANSFER_SCOPE_KEYS: &[&str] = &[
     "canonical_path",
     "destination_class",
     "direction",
+    "semantic_ref",
+    "delivery_mode",
     "permission_mode",
     "managed_policy_sha256",
     "user_policy_sha256",
@@ -322,6 +324,7 @@ const BROWSER_BOUND_INPUT_OPERATIONS: &[&str] = &[
     "browser_click",
     "browser_type",
     "browser_pointer",
+    "browser_download",
 ];
 const BROWSER_BOUND_INPUT_SCOPE_KEYS: &[&str] = &[
     "daemon_generation",
@@ -329,6 +332,8 @@ const BROWSER_BOUND_INPUT_SCOPE_KEYS: &[&str] = &[
     "browser_binding",
     "tab",
     "origin",
+    "semantic_ref",
+    "delivery_mode",
     "permission_mode",
     "managed_policy_sha256",
     "user_policy_sha256",
@@ -1777,6 +1782,10 @@ mod tests {
         assert_eq!(
             ids("browser_click", serde_json::json!({})),
             vec!["browser_bound_input"]
+        );
+        assert_eq!(
+            ids("browser_download", serde_json::json!({})),
+            vec!["file_transfer_and_output", "browser_bound_input"]
         );
         assert_eq!(
             ids("kill_app", serde_json::json!({})),

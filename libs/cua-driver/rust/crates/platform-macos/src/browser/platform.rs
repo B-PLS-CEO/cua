@@ -12,7 +12,7 @@ use cua_driver_core::browser::existing_profile_setup_descriptor;
 use cua_driver_core::browser::platform::{
     BrowserConsentOutcome, BrowserConsentRequest, BrowserPlatform, BrowserVisualAction,
     BrowserVisualActionKind, ExistingProfileSetupOutcome, ExistingProfileSetupRequest,
-    PrepareAction, PrepareOutcome, PrepareRequest,
+    NativeBrowserActivationRequest, PrepareAction, PrepareOutcome, PrepareRequest,
 };
 use cua_driver_core::browser::refusal::{BrowserRefusal, BrowserRefusalCode};
 use cua_driver_core::browser::types::{
@@ -496,6 +496,54 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                 },
             );
         }
+    }
+
+    async fn activate_browser_point_with_native_input(
+        &self,
+        request: NativeBrowserActivationRequest,
+    ) -> Result<(), BrowserRefusal> {
+        if !request.screen_x.is_finite() || !request.screen_y.is_finite() {
+            return Err(BrowserRefusal::new(
+                BrowserRefusalCode::BrowserInputTrustUnavailable,
+                "native browser activation received a non-finite screen point",
+            ));
+        }
+        let pid = libc::pid_t::try_from(request.pid).map_err(|_| {
+            BrowserRefusal::new(
+                BrowserRefusalCode::BrowserInputTrustUnavailable,
+                "native browser activation received an invalid process identity",
+            )
+        })?;
+        let window_id = u32::try_from(request.window_id).map_err(|_| {
+            BrowserRefusal::new(
+                BrowserRefusalCode::BrowserInputTrustUnavailable,
+                "native browser activation received an invalid window identity",
+            )
+        })?;
+        tokio::task::spawn_blocking(move || {
+            crate::input::skylight::with_foreground_hid_activation(pid, window_id, || {
+                crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor(
+                    request.screen_x,
+                    request.screen_y,
+                    1,
+                    "left",
+                    &[],
+                )
+            })
+        })
+        .await
+        .map_err(|error| {
+            BrowserRefusal::new(
+                BrowserRefusalCode::BrowserInputTrustUnavailable,
+                format!("native browser activation task failed: {error}"),
+            )
+        })?
+        .map_err(|error| {
+            BrowserRefusal::new(
+                BrowserRefusalCode::BrowserInputTrustUnavailable,
+                format!("native browser activation failed: {error}"),
+            )
+        })
     }
 
     async fn classify_browser(&self, pid: i64) -> Result<BrowserClassification, BrowserRefusal> {

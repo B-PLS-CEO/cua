@@ -374,7 +374,26 @@ approval and saves the result under an existing canonical absolute
 serializes Chromium's browser-wide download setting, restores that setting on
 every outcome, and returns only an opaque download id and byte count. It never
 returns the source URL, filename, or destination path. Direct raw calls without
-the host approval proof are refused.
+the host approval proof are refused. The default `delivery_mode:"background"`
+keeps the existing synthetic DOM activation and never foregrounds the browser.
+If a current ref's provider handler requires a trusted event, re-snapshot and
+retry only after explicit approval with `delivery_mode:"foreground"`. That
+rung uses trusted CDP Input, may visibly activate a standalone browser, and is
+bound into both the exact browser-resource and file-transfer approval scopes;
+the same download-event and contained-file receipt remains mandatory. If the
+provider still converts that event into navigation, `native_foreground` is the
+final explicit rung: it requires a visible main-frame ref, maps its live CDP
+box through current layout/native-window geometry, and uses the platform's
+guarded native click while briefly foregrounding that exact window. It never
+accepts navigation as download evidence and has no automatic fallback.
+
+`native_foreground` is one shared cross-platform value, not a per-platform
+parameter, and `browser_download` is the only tool that implements it. A
+platform without a guarded native-input path for an exact browser point refuses
+it with `browser_input_trust_unavailable`, naming the mode; every other tool
+that accepts `delivery_mode` refuses it with `delivery_mode_unsupported`. No
+backend downgrades it to `foreground` or `background` — a refusal is the answer,
+because a lower rung would report a native click that never happened.
 
 ## Browser chrome and native fallbacks
 

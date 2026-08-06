@@ -13,13 +13,15 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::protocol::ToolResult;
-use crate::tool::{Tool, ToolDef};
+use crate::tool::{ProtectedResourceOwnership, Tool, ToolDef};
 use crate::tool_args::ArgsExt;
 
 use super::cdp_ws::CdpConnection;
-use super::engine::BrowserEngine;
+use super::engine::{viewport_point_to_screen, BrowserEngine};
+use super::platform::{BrowserVisualActionKind, NativeBrowserActivationRequest};
 use super::refusal::{BrowserRefusal, BrowserRefusalCode};
 use super::store::BrowserActionKind;
+use super::tools::{browser_protected_resource_scope, browser_resource_ownership, quad_center};
 
 /// Injected by an MCP host only after its destructive-tool approval flow.
 /// It is intentionally absent from the public input schema.
@@ -65,7 +67,8 @@ impl BrowserDownloadTool {
                         "destination_root": {
                             "type": "string",
                             "description": "Absolute, existing, canonical directory approved to receive the download."
-                        }
+                        },
+                        "delivery_mode": download_delivery_mode_schema()
                     },
                     "required": ["session", "target_id", "tab_id", "ref", "destination_root"],
                     "additionalProperties": true
@@ -77,6 +80,36 @@ impl BrowserDownloadTool {
             },
             engine,
         }
+    }
+}
+
+fn download_delivery_mode_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["background", "foreground", "native_foreground"],
+        "default": "background",
+        "description": "background (default) preserves the existing synthetic DOM activation. foreground explicitly permits trusted CDP Input. native_foreground permits guarded native input at the exact main-frame ref point. Both foreground rungs may visibly activate a standalone browser and require explicit approval."
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadDeliveryMode {
+    Background,
+    Foreground,
+    NativeForeground,
+}
+
+fn delivery_mode(args: &Value) -> Result<DownloadDeliveryMode, ToolResult> {
+    match args.get("delivery_mode") {
+        None => Ok(DownloadDeliveryMode::Background),
+        Some(Value::String(mode)) if mode == "background" => Ok(DownloadDeliveryMode::Background),
+        Some(Value::String(mode)) if mode == "foreground" => Ok(DownloadDeliveryMode::Foreground),
+        Some(Value::String(mode)) if mode == "native_foreground" => {
+            Ok(DownloadDeliveryMode::NativeForeground)
+        }
+        _ => Err(ToolResult::error(
+            "delivery_mode must be background, foreground, or native_foreground",
+        )),
     }
 }
 
@@ -277,7 +310,35 @@ impl Tool for BrowserDownloadTool {
         &self.def
     }
 
+    async fn protected_resource_ownership(
+        &self,
+        adapter_id: &str,
+        args: &Value,
+    ) -> ProtectedResourceOwnership {
+        if adapter_id == "browser_bound_input" {
+            browser_resource_ownership(&self.engine, args)
+        } else {
+            ProtectedResourceOwnership::UserOwned
+        }
+    }
+
+    async fn protected_resource_scope(
+        &self,
+        adapter_id: &str,
+        args: &Value,
+    ) -> Result<Option<Value>, String> {
+        if adapter_id == "browser_bound_input" {
+            browser_protected_resource_scope(&self.engine, args, "browser_download").await
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn invoke(&self, args: Value) -> ToolResult {
+        let mode = match delivery_mode(&args) {
+            Ok(mode) => mode,
+            Err(error) => return error,
+        };
         let (session, target_id, tab_id, ext_ref, destination_raw) = match (
             explicit_session(&args),
             args.require_str("target_id"),
@@ -435,29 +496,219 @@ impl Tool for BrowserDownloadTool {
             .to_tool_result();
         }
 
-        let trigger = validated
-            .conn
-            .call(
-                Some(&ref_session),
-                "Runtime.callFunctionOn",
-                json!({
-                    "objectId": object_id,
-                    "functionDeclaration": "function() { this.click(); }",
-                    "userGesture": true,
-                    "awaitPromise": false
-                }),
-            )
-            .await;
-        let trigger_failed = trigger
-            .as_ref()
-            .map_or(true, |result| result.get("exceptionDetails").is_some());
-        if trigger_failed {
+        let trigger = match mode {
+            DownloadDeliveryMode::Background => {
+                let triggered = validated
+                    .conn
+                    .call(
+                        Some(&ref_session),
+                        "Runtime.callFunctionOn",
+                        json!({
+                            "objectId": object_id,
+                            "functionDeclaration": "function() { this.click(); }",
+                            "userGesture": true,
+                            "awaitPromise": false
+                        }),
+                    )
+                    .await;
+                if triggered
+                    .as_ref()
+                    .map_or(true, |result| result.get("exceptionDetails").is_some())
+                {
+                    Err(BrowserRefusal::new(
+                        BrowserRefusalCode::BrowserRefStale,
+                        "the exact download ref could not be activated",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            DownloadDeliveryMode::Foreground => {
+                // This is the explicit trusted rung. Unlike HTMLElement.click(),
+                // CDP Input produces an isTrusted event. Chromium may activate a
+                // standalone browser while delivering it, so callers must name
+                // foreground mode and that mode is included in both protected
+                // browser-resource and file-transfer approval scopes.
+                let _ = validated
+                    .conn
+                    .call(
+                        Some(&ref_session),
+                        "DOM.scrollIntoViewIfNeeded",
+                        json!({ "backendNodeId": entry.backend_node_id }),
+                    )
+                    .await;
+                let point = validated
+                    .conn
+                    .call(
+                        Some(&ref_session),
+                        "DOM.getBoxModel",
+                        json!({ "backendNodeId": entry.backend_node_id }),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|model| quad_center(&model));
+                let Some((x, y)) = point else {
+                    reset_download_behavior(&validated.conn).await;
+                    return BrowserRefusal::new(
+                        BrowserRefusalCode::BrowserRefStale,
+                        "the exact download ref has no trusted activation point",
+                    )
+                    .to_tool_result();
+                };
+                if validated
+                    .conn
+                    .call(
+                        Some(&ref_session),
+                        "Emulation.setFocusEmulationEnabled",
+                        json!({ "enabled": true }),
+                    )
+                    .await
+                    .is_err()
+                {
+                    Err(BrowserRefusal::new(
+                        BrowserRefusalCode::BrowserInputTrustUnavailable,
+                        "the exact tab could not enter focus emulation for trusted download activation",
+                    ))
+                } else {
+                    let mut delivery_error = None;
+                    for event_type in ["mousePressed", "mouseReleased"] {
+                        if validated
+                            .conn
+                            .call(
+                                Some(&ref_session),
+                                "Input.dispatchMouseEvent",
+                                json!({
+                                    "type": event_type,
+                                    "x": x,
+                                    "y": y,
+                                    "button": "left",
+                                    "clickCount": 1
+                                }),
+                            )
+                            .await
+                            .is_err()
+                        {
+                            delivery_error = Some(());
+                            break;
+                        }
+                    }
+                    let cleanup_failed = validated
+                        .conn
+                        .call(
+                            Some(&ref_session),
+                            "Emulation.setFocusEmulationEnabled",
+                            json!({ "enabled": false }),
+                        )
+                        .await
+                        .is_err();
+                    match (delivery_error, cleanup_failed) {
+                        (Some(_), _) => Err(BrowserRefusal::new(
+                            BrowserRefusalCode::BrowserInputTrustUnavailable,
+                            "trusted download activation could not be delivered",
+                        )),
+                        (None, true) => Err(BrowserRefusal::new(
+                            BrowserRefusalCode::BrowserInputTrustUnavailable,
+                            "trusted download activation was acknowledged but focus emulation could not be restored; delivery is unknown and must not be retried automatically",
+                        )),
+                        (None, false) => Ok(()),
+                    }
+                }
+            }
+            DownloadDeliveryMode::NativeForeground => {
+                if ref_session != validated.cdp_session {
+                    Err(BrowserRefusal::new(
+                        BrowserRefusalCode::BrowserInputTrustUnavailable,
+                        "native foreground download activation requires a main-frame ref",
+                    ))
+                } else {
+                    let _ = validated
+                        .conn
+                        .call(
+                            Some(&ref_session),
+                            "DOM.scrollIntoViewIfNeeded",
+                            json!({ "backendNodeId": entry.backend_node_id }),
+                        )
+                        .await;
+                    let viewport_point = validated
+                        .conn
+                        .call(
+                            Some(&ref_session),
+                            "DOM.getBoxModel",
+                            json!({ "backendNodeId": entry.backend_node_id }),
+                        )
+                        .await
+                        .ok()
+                        .and_then(|model| quad_center(&model));
+                    let tab_is_visible = validated
+                        .conn
+                        .call(
+                            Some(&ref_session),
+                            "Runtime.evaluate",
+                            json!({
+                                "expression": "document.visibilityState === 'visible'",
+                                "returnByValue": true,
+                                "awaitPromise": false
+                            }),
+                        )
+                        .await
+                        .ok()
+                        .and_then(|result| result.pointer("/result/value").and_then(Value::as_bool))
+                        .unwrap_or(false);
+                    let screen_point = if tab_is_visible {
+                        match viewport_point {
+                            Some((x, y)) => validated
+                                .conn
+                                .call(Some(&ref_session), "Page.getLayoutMetrics", json!({}))
+                                .await
+                                .ok()
+                                .and_then(|metrics| {
+                                    viewport_point_to_screen(
+                                        validated.native.bounds,
+                                        &metrics,
+                                        x,
+                                        y,
+                                    )
+                                }),
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let Some((screen_x, screen_y)) = screen_point else {
+                        reset_download_behavior(&validated.conn).await;
+                        return BrowserRefusal::new(
+                            BrowserRefusalCode::BrowserInputTrustUnavailable,
+                            "the exact main-frame download ref is not visibly native-activatable",
+                        )
+                        .to_tool_result();
+                    };
+                    if let Some((viewport_x, viewport_y)) = viewport_point {
+                        self.engine
+                            .visualize_browser_action(
+                                &session,
+                                &validated,
+                                &ref_session,
+                                viewport_x,
+                                viewport_y,
+                                BrowserVisualActionKind::Click,
+                            )
+                            .await;
+                    }
+                    self.engine
+                        .platform
+                        .activate_browser_point_with_native_input(NativeBrowserActivationRequest {
+                            pid: validated.native.pid,
+                            window_id: validated.native.window_id,
+                            screen_x,
+                            screen_y,
+                        })
+                        .await
+                }
+            }
+        };
+        if let Err(refusal) = trigger {
             reset_download_behavior(&validated.conn).await;
-            return BrowserRefusal::new(
-                BrowserRefusalCode::BrowserRefStale,
-                "the exact download ref could not be activated",
-            )
-            .to_tool_result();
+            return refusal.to_tool_result();
         }
 
         let mut observed_guid = None;
@@ -471,9 +722,18 @@ impl Tool for BrowserDownloadTool {
         match outcome {
             Ok(DownloadEventOutcome::Completed { guid }) => {
                 match completed_download_size(&destination_root, &guid) {
-                    Ok(bytes) => ToolResult::text("browser download completed").with_structured(
-                        json!({ "status": "completed", "download_id": guid, "bytes": bytes }),
-                    ),
+                    Ok(bytes) => {
+                        ToolResult::text("browser download completed").with_structured(json!({
+                            "status": "completed",
+                            "download_id": guid,
+                            "bytes": bytes,
+                            "delivery_mode": match mode {
+                                DownloadDeliveryMode::Background => "background",
+                                DownloadDeliveryMode::Foreground => "foreground",
+                                DownloadDeliveryMode::NativeForeground => "native_foreground",
+                            }
+                        }))
+                    }
                     Err(refusal) => refusal.to_tool_result(),
                 }
             }
@@ -495,11 +755,24 @@ impl Tool for BrowserDownloadTool {
             }
             Err(_) => {
                 remove_proven_partial(&destination_root, observed_guid.as_deref());
-                BrowserRefusal::new(
+                let refusal = BrowserRefusal::new(
                     BrowserRefusalCode::BrowserActionUnavailable,
                     "the approved browser download did not complete within 30 seconds",
-                )
-                .to_tool_result()
+                );
+                if mode == DownloadDeliveryMode::Background {
+                    refusal
+                        .with_detail(json!({
+                            "delivery_mode": "background",
+                            "escalation": {
+                                "recommended": "foreground",
+                                "requires_fresh_ref": true,
+                                "reason": "the synthetic activation did not emit a correlated browser download event"
+                            }
+                        }))
+                        .to_tool_result()
+                } else {
+                    refusal.to_tool_result()
+                }
             }
         }
     }
@@ -576,6 +849,34 @@ mod tests {
     fn cdp_download_path_preserves_ordinary_paths() {
         let path = Path::new("/tmp/approved-downloads");
         assert_eq!(download_path_for_cdp(path), path.to_string_lossy());
+    }
+
+    #[test]
+    fn delivery_mode_defaults_to_background_and_requires_exact_values() {
+        assert_eq!(
+            delivery_mode(&json!({})).unwrap(),
+            DownloadDeliveryMode::Background
+        );
+        assert_eq!(
+            delivery_mode(&json!({ "delivery_mode": "foreground" })).unwrap(),
+            DownloadDeliveryMode::Foreground
+        );
+        assert_eq!(
+            delivery_mode(&json!({ "delivery_mode": "native_foreground" })).unwrap(),
+            DownloadDeliveryMode::NativeForeground
+        );
+        assert!(delivery_mode(&json!({ "delivery_mode": "auto" })).is_err());
+        assert!(delivery_mode(&json!({ "delivery_mode": true })).is_err());
+    }
+
+    #[test]
+    fn schema_declares_background_default_and_explicit_foreground_rung() {
+        let schema = download_delivery_mode_schema();
+        assert_eq!(schema["default"], "background");
+        assert_eq!(
+            schema["enum"],
+            json!(["background", "foreground", "native_foreground"])
+        );
     }
 
     #[cfg(target_os = "windows")]

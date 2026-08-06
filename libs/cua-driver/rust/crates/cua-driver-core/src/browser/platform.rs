@@ -120,6 +120,17 @@ pub struct BrowserConsentRequest {
     pub attempt: u8,
 }
 
+/// Exact screen point produced by core from one revalidated main-frame
+/// semantic ref and Chromium's current layout metrics. Platform adapters may
+/// use this only for an explicitly approved foreground/native browser action.
+#[derive(Debug, Clone, Copy)]
+pub struct NativeBrowserActivationRequest {
+    pub pid: i64,
+    pub window_id: u64,
+    pub screen_x: f64,
+    pub screen_y: f64,
+}
+
 /// Exact, already-approved browser/window scope for enabling an existing
 /// Chromium profile's own DevTools endpoint. Core consumes the approval and
 /// validates this native window before invoking the platform adapter.
@@ -236,6 +247,30 @@ pub trait BrowserPlatform: Send + Sync {
     /// not change behavior. Implementations must not deliver input or alter
     /// focus/z-order; failures are intentionally not part of browser results.
     async fn visualize_browser_action(&self, _action: BrowserVisualAction) {}
+
+    /// Deliver one native foreground click to an exact, already-revalidated
+    /// main-frame browser point — the `delivery_mode: "native_foreground"`
+    /// rung of the shared delivery ladder.
+    ///
+    /// The default refuses, naming the rung, so a platform must opt in with a
+    /// guarded native-input implementation rather than silently falling back to
+    /// CDP or DOM input. A backend that cannot deliver the rung must keep
+    /// refusing: downgrading to `foreground` would report a native click that
+    /// never happened.
+    async fn activate_browser_point_with_native_input(
+        &self,
+        _request: NativeBrowserActivationRequest,
+    ) -> Result<(), BrowserRefusal> {
+        Err(BrowserRefusal::new(
+            super::refusal::BrowserRefusalCode::BrowserInputTrustUnavailable,
+            "delivery_mode \"native_foreground\" is unavailable on this platform: it has no \
+             guarded native-input path for an exact browser point",
+        )
+        .with_detail(serde_json::json!({
+            "unsupported_delivery_mode": "native_foreground",
+            "supported_delivery_mode": ["background", "foreground"]
+        })))
+    }
 
     /// Classify `pid`: is it a browser, which engine family, can it do
     /// CDP at all. Must not have side effects.

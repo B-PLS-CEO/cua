@@ -72,6 +72,10 @@ impl EventKind {
 ///   a structured `background_unavailable` error instead of fronting.
 /// - `Foreground`: briefly front the target window, act via SendInput, then
 ///   restore the prior foreground. The agent's explicit last resort.
+///
+/// The shared contract carries a third rung, `native_foreground`. Windows input
+/// tools do not implement it; the registry refuses it for them before dispatch
+/// (see `cua_driver_core::tool`) so it is never resolved to a lower rung here.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum DeliveryMode {
     /// PostMessage / UIA only. Error if delivery would be silently dropped.
@@ -105,8 +109,9 @@ impl DeliveryMode {
 }
 
 /// JSON-schema fragment for the `delivery_mode` field. Include this in every
-/// input tool's `input_schema.properties.delivery_mode`. Two modes, matching
-/// the macOS surface.
+/// input tool's `input_schema.properties.delivery_mode`. The shared three-rung
+/// ladder, matching the macOS surface; Windows input delivers two of the three
+/// and the native rung is refused explicitly at dispatch.
 pub fn delivery_mode_schema() -> Value {
     // Borrow the canonical SHAPE (type/enum) from the shared cross-platform
     // builder so it can never drift from the consistency gate, while keeping the
@@ -127,7 +132,11 @@ pub fn delivery_mode_schema() -> Value {
          verified no-op). Only THEN re-issue the same action with 'foreground'. \
          The lists above are the driver's detectors, not a checklist for you to \
          front on a guess — fronting up-front needlessly steals the user's focus \
-         and is a bug, not a shortcut. Matches the macOS delivery_mode surface.",
+         and is a bug, not a shortcut. \
+         'native_foreground' belongs to the shared ladder but is always refused \
+         for Windows input tools: there is no guarded native-input path here, so \
+         the request is answered rather than downgraded. \
+         Matches the macOS delivery_mode surface.",
     )
 }
 

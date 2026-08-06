@@ -952,6 +952,14 @@ impl ToolRegistry {
             return ToolResult::error(format!("Unknown tool: {name}"));
         };
 
+        // The `delivery_mode` ladder is one shared cross-platform contract, so
+        // every tool that accepts the param advertises all three rungs. A tool
+        // with no native rung must refuse it before consent, cursor, recording,
+        // or platform work begins — never parse it away into `background`.
+        if let Some(refusal) = native_delivery_rung_refusal(resolved_name, &args) {
+            return refusal;
+        }
+
         // This registry is the canonical native dispatch boundary shared by
         // the same-process SDK and every transport adapter. Authorization must
         // live here: transport-only checks leave CuaDriver::create() able to
@@ -1803,16 +1811,37 @@ impl ToolRegistry {
                 let destination =
                     canonical_existing_directory(required_path_arg(args, "destination_root")?)?;
                 args["destination_root"] = Value::String(destination.clone());
+                let delivery_mode =
+                    match args.get("delivery_mode") {
+                        None => "background",
+                        Some(Value::String(mode))
+                            if mode == "background"
+                                || mode == "foreground"
+                                || mode == "native_foreground" =>
+                        {
+                            mode.as_str()
+                        }
+                        _ => return Err(ToolResult::error(
+                            "delivery_mode must be background, foreground, or native_foreground",
+                        )),
+                    };
                 (
                     serde_json::json!({
                         "kind": "browser_download",
                         "target_id": args.get("target_id").and_then(Value::as_str),
                         "tab_id": args.get("tab_id").and_then(Value::as_str),
                         "ref": args.get("ref").and_then(Value::as_str),
+                        "delivery_mode": delivery_mode,
                         "direction": "browser_to_local",
                         "canonical_destination_root": destination,
                     }),
-                    "Allow Cua to download one file from this browser tab to the exact destination directory".to_owned(),
+                    if delivery_mode == "native_foreground" {
+                        "Allow Cua to briefly foreground this exact browser window, deliver one native click to this exact control, and download one file to the exact destination directory".to_owned()
+                    } else if delivery_mode == "foreground" {
+                        "Allow Cua to visibly activate this exact browser control and download one file to the exact destination directory".to_owned()
+                    } else {
+                        "Allow Cua to download one file from this browser tab to the exact destination directory".to_owned()
+                    },
                 )
             }
             "clipboard_write" => {
@@ -3871,6 +3900,44 @@ fn protected_refusal(code: &str, message: &str) -> ToolResult {
     }))
 }
 
+/// Tools that answer for the `native_foreground` rung themselves. The browser
+/// surface refuses through the typed `BrowserRefusalCode` channel (and, for
+/// `browser_download`, actually delivers the rung on a backend that implements
+/// `BrowserPlatform::activate_browser_point_with_native_input`), so the shared
+/// dispatch guard must not pre-empt it.
+fn owns_native_delivery_rung_decision(tool_name: &str) -> bool {
+    matches!(tool_name, "browser_download" | "browser_dialog")
+}
+
+/// Refuse `delivery_mode: "native_foreground"` for every tool whose delivery
+/// ladder has no native rung.
+///
+/// The rung is part of the shared cross-platform `delivery_mode` canon, so it
+/// reaches tools that cannot deliver it. Those tools' `DeliveryMode::parse`
+/// resolves any non-`foreground` string to `background`, which would silently
+/// downgrade an explicit escalation into the weakest rung — and, on the bounded
+/// permission path, prompt for a `delivery_mode_ceiling` nothing honours.
+/// Answer it honestly here instead, at the canonical dispatch boundary, so the
+/// refusal is identical on macOS, Windows, X11, and Wayland rather than
+/// re-derived in each thin adapter.
+fn native_delivery_rung_refusal(tool_name: &str, args: &Value) -> Option<ToolResult> {
+    if owns_native_delivery_rung_decision(tool_name) {
+        return None;
+    }
+    if args.get("delivery_mode").and_then(Value::as_str) != Some("native_foreground") {
+        return None;
+    }
+    Some(protected_refusal(
+        "delivery_mode_unsupported",
+        &format!(
+            "'{tool_name}' cannot honour delivery_mode \"native_foreground\": that rung \
+             delivers real OS-level input at an exact screen point and is implemented only \
+             for browser_download. Re-issue with \"background\", or with \"foreground\" once \
+             a background attempt is proven not to have landed."
+        ),
+    ))
+}
+
 fn is_existing_profile_prepare(tool_name: &str, args: &Value) -> bool {
     tool_name == "browser_prepare"
         && args
@@ -4306,6 +4373,56 @@ mod capability_tests {
         // the version is the contract version, not the build version.
         // Pinned to "1" until we ship a BREAKING vocabulary change.
         assert_eq!(CAPABILITY_VERSION, "1");
+    }
+
+    #[test]
+    fn tools_without_a_native_rung_refuse_native_foreground_instead_of_downgrading() {
+        let native = serde_json::json!({ "delivery_mode": "native_foreground" });
+
+        // Every desktop input tool advertises the shared three-rung ladder but
+        // delivers only two. `DeliveryMode::parse` on each platform resolves any
+        // non-"foreground" string to Background, so without this guard the
+        // strongest rung would silently become the weakest one.
+        for tool in [
+            "click",
+            "double_click",
+            "right_click",
+            "drag",
+            "type_text",
+            "press_key",
+            "hotkey",
+            "scroll",
+        ] {
+            let refusal = native_delivery_rung_refusal(tool, &native)
+                .unwrap_or_else(|| panic!("{tool} must refuse the native rung"));
+            assert_eq!(refusal.is_error, Some(true));
+            let structured = refusal
+                .structured_content
+                .as_ref()
+                .expect("refusal is structured");
+            assert_eq!(structured["status"], "refused");
+            assert_eq!(structured["refusal"]["code"], "delivery_mode_unsupported");
+            let message = structured["refusal"]["message"]
+                .as_str()
+                .expect("refusal message");
+            assert!(
+                message.contains("native_foreground") && message.contains(tool),
+                "{tool} refusal must name the tool and the mode: {message}"
+            );
+        }
+
+        // The browser surface answers for itself through BrowserRefusalCode:
+        // browser_download can honour the rung where the backend implements it,
+        // and browser_dialog refuses it with a typed browser refusal.
+        assert!(native_delivery_rung_refusal("browser_download", &native).is_none());
+        assert!(native_delivery_rung_refusal("browser_dialog", &native).is_none());
+
+        // The two rungs every backend does deliver are untouched.
+        for mode in ["background", "foreground"] {
+            let args = serde_json::json!({ "delivery_mode": mode });
+            assert!(native_delivery_rung_refusal("click", &args).is_none());
+        }
+        assert!(native_delivery_rung_refusal("click", &serde_json::json!({})).is_none());
     }
 
     #[test]

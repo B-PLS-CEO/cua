@@ -1,9 +1,12 @@
 //! Shared delivery-mode logic for cua-driver Linux input tools.
 //!
 //! Mirrors macOS `tools::DeliveryMode` and Windows `input::delivery`: each
-//! input tool accepts an optional `delivery_mode` field with exactly two modes
-//! — the agent-selected rung of the best-effort-background ladder, passed per
-//! call (never a stored setting):
+//! input tool accepts an optional `delivery_mode` field — the agent-selected
+//! rung of the best-effort-background ladder, passed per call (never a stored
+//! setting). The shared contract has three rungs; Linux input delivers two of
+//! them, and the registry refuses `native_foreground` for these tools before
+//! any Linux code runs (see `cua_driver_core::tool`), so it is never quietly
+//! resolved to a lower rung here:
 //!
 //! - `background` (DEFAULT) — inject without activating/raising the target.
 //!   - **X11**: XTEST / XSendEvent / XInput2 MPX master-pointer no-focus-steal
@@ -46,6 +49,10 @@ impl DeliveryMode {
     /// explicit case-insensitive `"foreground"` resolves to `Background` — the
     /// correct default, so an omitted/garbage value never silently fronts.
     /// Matches macOS / Windows `DeliveryMode::parse`.
+    ///
+    /// `"native_foreground"` is a real rung of the shared ladder, not garbage,
+    /// so it must never reach this function as a downgrade: the registry
+    /// refuses it for every tool without a native rung before dispatch.
     pub fn parse(arg: Option<&str>) -> Self {
         match arg {
             Some(s) if s.eq_ignore_ascii_case("foreground") => Self::Foreground,
@@ -64,8 +71,9 @@ impl DeliveryMode {
 }
 
 /// JSON-schema fragment for the `delivery_mode` field. Include this in every
-/// input tool's `input_schema.properties.delivery_mode`. Two modes, matching
-/// the macOS / Windows surface.
+/// input tool's `input_schema.properties.delivery_mode`. The shared three-rung
+/// ladder, matching the macOS / Windows surface; Linux input delivers two of
+/// the three and refuses the native rung explicitly.
 pub fn delivery_mode_schema() -> Value {
     // Source the SHAPE (`type` + `enum`) from the shared canon so it can't drift
     // from macOS / Windows, while keeping the Linux-specific Wayland/X11 prose
@@ -82,8 +90,11 @@ pub fn delivery_mode_schema() -> Value {
          error. 'foreground' is the explicit escalation: activate the target \
          (X11 _NET_ACTIVE_WINDOW; Wayland compositor activate), inject, then \
          restore the prior active window — a brief focus swap unless the \
-         target was already active. Matches the macOS / Windows delivery_mode \
-         surface.",
+         target was already active. 'native_foreground' belongs to the shared \
+         ladder but is always refused for Linux input tools: neither the X11 \
+         nor the Wayland path can deliver a real pointer event to an exact \
+         point inside a target, so the request is answered rather than \
+         downgraded. Matches the macOS / Windows delivery_mode surface.",
     );
     v["default"] = serde_json::json!("background");
     v
@@ -206,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn delivery_mode_schema_advertises_two_modes() {
+    fn delivery_mode_schema_carries_the_shared_three_rung_ladder() {
         let s = delivery_mode_schema();
         let en: Vec<&str> = s["enum"]
             .as_array()
@@ -214,12 +225,32 @@ mod tests {
             .iter()
             .filter_map(|v| v.as_str())
             .collect();
-        assert_eq!(en, vec!["background", "foreground"]);
+        // The shape is the shared cross-platform canon, including the native
+        // rung Linux input cannot deliver. The registry refuses that rung for
+        // these tools; the schema must not fork per platform.
+        assert_eq!(en, vec!["background", "foreground", "native_foreground"]);
         assert_eq!(s["default"], "background");
         let description = s["description"]
             .as_str()
             .expect("delivery_mode description");
         assert!(!description.contains("bring_to_front"));
+        assert!(
+            description.contains("native_foreground"),
+            "the Linux prose must state what happens to the native rung: {description}"
+        );
+    }
+
+    #[test]
+    fn the_native_rung_is_never_treated_as_a_delivered_linux_escalation() {
+        // `parse` must not be what answers `native_foreground`: resolving it
+        // here would be a silent downgrade of an explicit escalation. The
+        // registry refuses it before any Linux input tool runs; this pins that
+        // no Linux path ever reads it as a granted foreground delivery.
+        let native = DeliveryMode::from_args(&serde_json::json!({
+            "delivery_mode": "native_foreground"
+        }));
+        assert_eq!(native, DeliveryMode::Background);
+        assert!(!native.is_foreground());
     }
 
     #[test]

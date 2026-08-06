@@ -22,10 +22,11 @@ use super::engine::BrowserEngine;
 use super::mock_cdp::{MockCdpServer, MockEvent, MockHandler, MockReply};
 use super::platform::{
     BrowserConsentOutcome, BrowserConsentRequest, BrowserPlatform, ExistingProfileSetupOutcome,
-    ExistingProfileSetupRequest, PrepareAction, PrepareOutcome, PrepareRequest,
+    ExistingProfileSetupRequest, NativeBrowserActivationRequest, PrepareAction, PrepareOutcome,
+    PrepareRequest,
 };
 use super::pointer::BrowserPointerTool;
-use super::refusal::BrowserRefusal;
+use super::refusal::{BrowserRefusal, BrowserRefusalCode};
 use super::tools::{
     browser_protected_resource_scope, BrowserClickTool, BrowserNavigateTool, BrowserPrepareTool,
     BrowserTypeTool, GetBrowserStateTool,
@@ -528,12 +529,19 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                 &[90, 100],
                 &[[0.0, 0.0, 300.0, 100.0], [10.0, 10.0, 120.0, 30.0]],
             )),
+            // Shaped like Chromium's own reply: the CSS viewport carries the
+            // pinch scale and the browser zoom factor that converts CSS
+            // pixels into the device-independent pixels window rects use.
             "Page.getLayoutMetrics" => MockReply::ok(json!({
                 "cssVisualViewport": {
+                    "offsetX": 0.0,
+                    "offsetY": 0.0,
                     "pageX": 0.0,
                     "pageY": 0.0,
                     "clientWidth": st.viewport_css_width,
-                    "clientHeight": st.viewport_css_height
+                    "clientHeight": st.viewport_css_height,
+                    "scale": 1.0,
+                    "zoom": 1.0
                 }
             })),
             "Runtime.evaluate"
@@ -1967,6 +1975,25 @@ async fn protected_browser_scope_reproves_live_origin_and_omits_sensitive_url_te
     assert_eq!(observation["action_class"], "page_observation");
     assert_eq!(first["action_class"], "page_input");
 
+    let download = browser_protected_resource_scope(
+        &f.engine,
+        &json!({
+            "target_id": target,
+            "tab_id": tab,
+            "session": SESSION,
+            "ref": "sem_exact_download",
+            "delivery_mode": "native_foreground",
+        }),
+        "browser_download",
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(download["action_class"], "file_transfer");
+    assert_eq!(download["ref"], "sem_exact_download");
+    assert_eq!(download["delivery_mode"], "native_foreground");
+    assert_eq!(download["live_origin"], "https://fixture.test");
+
     f.state.lock().unwrap().main_url = "https://bank.example/transfer?secret=one-time-token".into();
     let second = browser_protected_resource_scope(&f.engine, &args, "browser_click")
         .await
@@ -1980,6 +2007,62 @@ async fn protected_browser_scope_reproves_live_origin_and_omits_sensitive_url_te
     assert!(
         !second.to_string().contains("one-time-token"),
         "query text must never reach the consent resource"
+    );
+}
+
+/// `native_foreground` is a value of the SHARED delivery ladder, so it reaches
+/// every backend — including the ones with no guarded native-input path.
+///
+/// `FixturePlatform` is such a backend: like the Windows and Linux adapters it
+/// does not deliver the native rung. It must answer the request with an
+/// explicit, typed refusal that names the mode. Returning `Ok(())` (accepting
+/// without clicking) or quietly succeeding through a lower rung would report a
+/// native activation that never happened.
+#[tokio::test]
+async fn a_backend_without_a_native_rung_refuses_native_foreground_activation() {
+    let f = fixture().await;
+
+    let refusal = f
+        .engine
+        .platform
+        .activate_browser_point_with_native_input(NativeBrowserActivationRequest {
+            pid: 1,
+            window_id: 7,
+            screen_x: 120.0,
+            screen_y: 240.0,
+        })
+        .await
+        .expect_err("a backend with no native rung must refuse, never accept");
+
+    assert_eq!(
+        refusal.code,
+        BrowserRefusalCode::BrowserInputTrustUnavailable
+    );
+    assert!(
+        refusal.message.contains("native_foreground"),
+        "the refusal must name the mode the caller asked for: {}",
+        refusal.message
+    );
+    let detail = refusal
+        .detail
+        .as_ref()
+        .expect("the refusal must carry machine-readable detail");
+    assert_eq!(
+        detail["unsupported_delivery_mode"], "native_foreground",
+        "the refusal must say which rung was refused: {detail}"
+    );
+    assert_eq!(
+        detail["supported_delivery_mode"],
+        json!(["background", "foreground"]),
+        "the refusal must not offer the native rung as its own substitute: {detail}"
+    );
+
+    let tool_result = refusal.to_tool_result();
+    let rendered = structured(&tool_result);
+    assert_eq!(rendered["status"], "refused");
+    assert_eq!(
+        rendered["refusal"]["code"],
+        "browser_input_trust_unavailable"
     );
 }
 
