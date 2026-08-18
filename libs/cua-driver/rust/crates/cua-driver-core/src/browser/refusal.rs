@@ -88,6 +88,34 @@ impl BrowserRefusalCode {
             Self::BrowserOriginOutsideScope => "browser_origin_outside_scope",
         }
     }
+
+    /// Parse only the closed browser-refusal wire vocabulary.
+    ///
+    /// Protected-resource adapters use this to carry a browser engine refusal
+    /// through the generic resource-attestation boundary without forwarding
+    /// its potentially private human-readable message. Unknown values remain
+    /// generic failures rather than becoming caller-selected refusal codes.
+    pub(crate) fn from_wire(value: &str) -> Option<Self> {
+        Some(match value {
+            "browser_route_unavailable" => Self::BrowserRouteUnavailable,
+            "browser_requires_setup" => Self::BrowserRequiresSetup,
+            "browser_binding_ambiguous" => Self::BrowserBindingAmbiguous,
+            "browser_binding_stale" => Self::BrowserBindingStale,
+            "browser_wrong_target_refused" => Self::BrowserWrongTargetRefused,
+            "browser_tab_required" => Self::BrowserTabRequired,
+            "browser_tab_not_found" => Self::BrowserTabNotFound,
+            "browser_ref_stale" => Self::BrowserRefStale,
+            "browser_input_trust_unavailable" => Self::BrowserInputTrustUnavailable,
+            "browser_endpoint_owner_mismatch" => Self::BrowserEndpointOwnerMismatch,
+            "browser_consent_required" => Self::BrowserConsentRequired,
+            "browser_consent_revoked" => Self::BrowserConsentRevoked,
+            "browser_reconnect_exhausted" => Self::BrowserReconnectExhausted,
+            "browser_input_incomplete" => Self::BrowserInputIncomplete,
+            "browser_action_unavailable" => Self::BrowserActionUnavailable,
+            "browser_origin_outside_scope" => Self::BrowserOriginOutsideScope,
+            _ => return None,
+        })
+    }
 }
 
 /// A structured refusal: stable code + human-readable message +
@@ -197,9 +225,14 @@ mod tests {
         ];
         for (code, wire) in all {
             assert_eq!(code.as_str(), wire);
+            assert_eq!(BrowserRefusalCode::from_wire(wire), Some(code));
             // serde and as_str must agree — consumers see the serde form.
             assert_eq!(serde_json::to_value(code).unwrap(), serde_json::json!(wire));
         }
+        assert_eq!(
+            BrowserRefusalCode::from_wire("private_or_future_code"),
+            None
+        );
     }
 
     #[test]
