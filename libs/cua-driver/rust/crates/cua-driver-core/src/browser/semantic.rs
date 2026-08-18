@@ -26,6 +26,7 @@ pub(crate) const SEMANTIC_COMPUTED_STYLES: &[&str] = &[
 pub(crate) const DEFAULT_SEMANTIC_NODE_BUDGET: usize = 300;
 const NEAR_VIEWPORT_MARGIN: f64 = 1_000.0;
 const MAX_SEMANTIC_TEXT_CHARS: usize = 1_000;
+const MAX_LINK_URL_BYTES: usize = 8 * 1_024;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Rect {
@@ -118,6 +119,12 @@ pub(crate) struct SemanticNode {
     pub(crate) role: String,
     pub(crate) name: Option<String>,
     pub(crate) value: Option<String>,
+    /// Literal, bounded DOM href for link-shaped nodes. Kept separate from
+    /// the AX value because browsers commonly expose no AX value for links.
+    /// Query strings and fragments remain exact for downstream identity and
+    /// origin policy checks; credential-bearing and non-web absolute URLs are
+    /// omitted rather than normalized into a different destination.
+    pub(crate) link_url: Option<String>,
     pub(crate) states: BTreeMap<String, Value>,
     pub(crate) frame: FrameRef,
     pub(crate) visibility: BrowserVisibility,
@@ -525,6 +532,10 @@ pub(crate) fn compose_accessibility_tree(
         let actions = action_kinds(&role, dom_meta, &states, layout_meta);
         let name = ax_value_string(ax.get("name")).and_then(clean_semantic_text);
         let value = ax_value_string(ax.get("value")).and_then(clean_semantic_text);
+        let link_url = (role == "link")
+            .then(|| dom_meta?.attrs.get("href").cloned())
+            .flatten()
+            .and_then(bounded_link_url);
         let document_order = dom_meta.map_or(fallback_order, |meta| meta.order);
         nodes.push(SemanticNode {
             ax_id,
@@ -546,6 +557,7 @@ pub(crate) fn compose_accessibility_tree(
             role,
             name,
             value,
+            link_url,
             states,
             frame: frame.clone(),
             visibility,
@@ -674,6 +686,10 @@ fn supplement_dom_actions(
             .iter()
             .find_map(|key| meta.attrs.get(*key).cloned())
             .and_then(clean_semantic_text);
+        let link_url = (role == "link")
+            .then(|| meta.attrs.get("href").cloned())
+            .flatten()
+            .and_then(bounded_link_url);
         nodes.push(SemanticNode {
             ax_id: format!("dom-{backend_node_id}"),
             parent_ax_id: meta
@@ -688,6 +704,7 @@ fn supplement_dom_actions(
                 .get("value")
                 .cloned()
                 .and_then(clean_semantic_text),
+            link_url,
             states,
             frame: frame.clone(),
             visibility,
@@ -949,6 +966,58 @@ fn clean_semantic_text(value: String) -> Option<String> {
         return None;
     }
     Some(normalized.chars().take(MAX_SEMANTIC_TEXT_CHARS).collect())
+}
+
+/// Preserve a DOM href exactly when it is safe to expose inside the existing
+/// private semantic observation boundary. Relative and HTTP(S) hrefs are
+/// observational data only: this function does not resolve or navigate them.
+/// Query strings and fragments are retained because removing them can change
+/// provider identity. Oversized, control-bearing, credential-bearing, and
+/// non-web absolute destinations are omitted instead of rewritten.
+fn bounded_link_url(value: String) -> Option<String> {
+    if value.is_empty()
+        || value.len() > MAX_LINK_URL_BYTES
+        || value
+            .chars()
+            .any(|ch| ch.is_ascii_control() || ch == '\u{7f}')
+    {
+        return None;
+    }
+
+    // Parse absolute values without a base first. Same-scheme hrefs without
+    // slashes can resolve differently depending on the document scheme, so a
+    // synthetic base must never reinterpret an absolute candidate as a safe
+    // relative path. Genuine relative hrefs are proved under both supported
+    // web document schemes; every browser interpretation must satisfy policy.
+    let parsed = match url::Url::parse(&value) {
+        Ok(parsed) => vec![parsed],
+        Err(url::ParseError::RelativeUrlWithoutBase) => {
+            let mut resolved = Vec::with_capacity(2);
+            for base_value in [
+                "http://semantic-observation.invalid/",
+                "https://semantic-observation.invalid/",
+            ] {
+                let base = url::Url::parse(base_value).ok()?;
+                resolved.push(
+                    url::Url::options()
+                        .base_url(Some(&base))
+                        .parse(&value)
+                        .ok()?,
+                );
+            }
+            resolved
+        }
+        Err(_) => return None,
+    };
+    if parsed.iter().any(|parsed| {
+        !matches!(parsed.scheme(), "http" | "https")
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+    }) {
+        return None;
+    }
+
+    Some(value)
 }
 
 fn remove_redundant_static_text(nodes: &mut Vec<SemanticNode>) {
@@ -1472,5 +1541,39 @@ mod tests {
             clean_semantic_text("\u{e001} Reply\u{00a0}now \u{f8ff}".to_owned()).as_deref(),
             Some("Reply now")
         );
+    }
+
+    #[test]
+    fn link_urls_remain_exact_and_fail_closed_without_truncation() {
+        let exact = "https://fixture.test/transactions/%C2%A0\u{200b}?signature=a%2Fb#page=2";
+        assert_eq!(
+            bounded_link_url(exact.to_owned()).as_deref(),
+            Some(exact),
+            "URL identity must not pass through semantic text normalization"
+        );
+
+        let long_signed = format!(
+            "https://fixture.test/document?signature={}",
+            "a".repeat(1_500)
+        );
+        assert_eq!(
+            bounded_link_url(long_signed.clone()).as_deref(),
+            Some(long_signed.as_str()),
+            "valid signed URLs longer than semantic labels must remain exact"
+        );
+        assert!(bounded_link_url(format!(
+            "/document?signature={}",
+            "a".repeat(MAX_LINK_URL_BYTES)
+        ))
+        .is_none());
+        assert!(bounded_link_url("https://user:secret@fixture.test/document".to_owned()).is_none());
+        assert!(bounded_link_url(r"\\user:secret@evil.test/path".to_owned()).is_none());
+        assert!(bounded_link_url(r"/\user:secret@evil.test/path".to_owned()).is_none());
+        assert!(bounded_link_url("https:user:secret@evil.test/path".to_owned()).is_none());
+        assert!(bounded_link_url("http:user:secret@evil.test/path".to_owned()).is_none());
+        assert!(bounded_link_url("javascript:alert(1)".to_owned()).is_none());
+        assert!(bounded_link_url("javascript://[".to_owned()).is_none());
+        assert!(bounded_link_url("data:text/plain,fixture".to_owned()).is_none());
+        assert!(bounded_link_url("/document\nother".to_owned()).is_none());
     }
 }

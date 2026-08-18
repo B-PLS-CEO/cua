@@ -195,17 +195,35 @@ fn main_document() -> Value {
 fn large_semantic_document() -> Value {
     let mut children = Vec::new();
     for id in 0..320_i64 {
-        children.push(json!({
-            "nodeType": 1,
-            "nodeName": "BUTTON",
-            "backendNodeId": 1_000 + id,
-            "attributes": [
-                "aria-hidden", "true",
-                "style", "display:none",
-                "aria-label", format!("Retained control {id}"),
-            ],
-        }));
+        if id == 0 {
+            children.push(json!({
+                "nodeType": 1,
+                "nodeName": "A",
+                "backendNodeId": 1_000 + id,
+                "attributes": [
+                    "aria-hidden", "true",
+                    "style", "display:none",
+                    "aria-label", "Hidden retained link",
+                    "href", "/transactions/hidden-must-not-leak",
+                ],
+            }));
+        } else {
+            children.push(json!({
+                "nodeType": 1,
+                "nodeName": "BUTTON",
+                "backendNodeId": 1_000 + id,
+                "attributes": [
+                    "aria-hidden", "true",
+                    "style", "display:none",
+                    "aria-label", format!("Retained control {id}"),
+                ],
+            }));
+        }
     }
+    let long_signed_href = format!(
+        "https://fixture.test/transactions/dom-supplement?signature={}#documents",
+        "a".repeat(1_500)
+    );
     children.extend([
         json!({
             "nodeType": 1,
@@ -228,6 +246,45 @@ fn large_semantic_document() -> Value {
                 "nodeValue": "Please review the attached fixture report.",
                 "backendNodeId": 2_003,
             }],
+        }),
+        json!({
+            "nodeType": 1,
+            "nodeName": "A",
+            "backendNodeId": 2_004,
+            "attributes": ["href", "/transactions/fixture-123"],
+            "children": [{
+                "nodeType": 3,
+                "nodeName": "#text",
+                "nodeValue": "Open transaction",
+                "backendNodeId": 2_005,
+            }],
+        }),
+        json!({
+            "nodeType": 1,
+            "nodeName": "A",
+            "backendNodeId": 2_012,
+            "attributes": [
+                "href", long_signed_href,
+                "aria-label", "DOM supplement transaction",
+            ],
+        }),
+        json!({
+            "nodeType": 1,
+            "nodeName": "A",
+            "backendNodeId": 2_013,
+            "attributes": [
+                "href", r"/\user:secret@evil.test/path",
+                "aria-label", "Unsafe DOM observed link",
+            ],
+        }),
+        json!({
+            "nodeType": 1,
+            "nodeName": "A",
+            "backendNodeId": 2_014,
+            "attributes": [
+                "href", "javascript://[",
+                "aria-label", "Unsafe AX observed link",
+            ],
         }),
         json!({
             "nodeType": 1,
@@ -297,6 +354,8 @@ fn large_semantic_ax_tree(frame_id: &str) -> Value {
     let mut child_ids = vec![
         "heading".to_owned(),
         "body".to_owned(),
+        "transaction-link".to_owned(),
+        "unsafe-ax-link".to_owned(),
         "editor".to_owned(),
         "reply".to_owned(),
     ];
@@ -325,6 +384,30 @@ fn large_semantic_ax_tree(frame_id: &str) -> Value {
             "backendDOMNodeId": 2003,
             "role": {"value": "StaticText"},
             "name": {"value": "Please review the attached fixture report."},
+            "childIds": []
+        }),
+        json!({
+            "nodeId": "transaction-link",
+            "parentId": "root-main",
+            "ignored": false,
+            "backendDOMNodeId": 2004,
+            "role": {"value": "link"},
+            "name": {"value": "Open transaction"},
+            "properties": [
+                {"name": "focusable", "value": {"value": true}}
+            ],
+            "childIds": []
+        }),
+        json!({
+            "nodeId": "unsafe-ax-link",
+            "parentId": "root-main",
+            "ignored": false,
+            "backendDOMNodeId": 2014,
+            "role": {"value": "link"},
+            "name": {"value": "Unsafe AX observed link"},
+            "properties": [
+                {"name": "focusable", "value": {"value": true}}
+            ],
             "childIds": []
         }),
         json!({
@@ -508,13 +591,17 @@ fn fixture_handler(state: SharedState) -> MockHandler {
             ]})),
             "DOMSnapshot.captureSnapshot" if is_tab => {
                 if st.semantic_large_page {
-                    let mut backends = vec![999, 2000, 2003, 2010, 2011];
+                    let mut backends = vec![999, 2000, 2003, 2004, 2010, 2011, 2012, 2013, 2014];
                     let mut bounds = vec![
                         [0.0, 0.0, 800.0, 600.0],
                         [20.0, 20.0, 500.0, 40.0],
                         [20.0, 80.0, 600.0, 80.0],
+                        [20.0, 150.0, 160.0, 30.0],
                         [20.0, 180.0, 600.0, 120.0],
                         [20.0, 320.0, 100.0, 36.0],
+                        [200.0, 320.0, 180.0, 36.0],
+                        [400.0, 320.0, 180.0, 36.0],
+                        [600.0, 320.0, 180.0, 36.0],
                     ];
                     for id in 0..305_i64 {
                         backends.push(3_000 + id);
@@ -1435,12 +1522,59 @@ async fn semantic_snapshot_keeps_visible_content_after_hidden_node_pressure() {
                 .is_some_and(|actions| actions.iter().any(|action| action == "type"))),
         "visible editor was omitted: {snap}"
     );
+    let transaction_link = refs
+        .iter()
+        .find(|entry| entry["name"] == "Open transaction")
+        .expect("visible transaction link");
+    assert_eq!(transaction_link["role"], "link", "{transaction_link}");
+    assert_eq!(
+        transaction_link["url"], "/transactions/fixture-123",
+        "link destination must be exposed separately from the AX value: {transaction_link}"
+    );
+    assert_eq!(transaction_link["value"], Value::Null, "{transaction_link}");
+    let dom_supplement = refs
+        .iter()
+        .find(|entry| entry["name"] == "DOM supplement transaction")
+        .expect("visible DOM-only link supplement");
+    let expected_long_url = format!(
+        "https://fixture.test/transactions/dom-supplement?signature={}#documents",
+        "a".repeat(1_500)
+    );
+    assert_eq!(dom_supplement["url"], expected_long_url, "{dom_supplement}");
+    let unsafe_dom_link = refs
+        .iter()
+        .find(|entry| entry["name"] == "Unsafe DOM observed link")
+        .expect("unsafe DOM link remains observable without a usable destination");
+    assert_eq!(
+        unsafe_dom_link["url"],
+        Value::Null,
+        "non-web schemes must remain inert"
+    );
+    let unsafe_ax_link = refs
+        .iter()
+        .find(|entry| entry["name"] == "Unsafe AX observed link")
+        .expect("unsafe AX link remains observable without a usable destination");
+    assert_eq!(
+        unsafe_ax_link["url"],
+        Value::Null,
+        "parser-error non-web schemes must remain inert"
+    );
+    let reply = refs
+        .iter()
+        .find(|entry| entry["name"] == "Reply")
+        .expect("visible Reply action");
+    assert_eq!(reply["url"], Value::Null, "non-links cannot acquire URLs");
     assert!(
         refs.iter().all(|entry| !entry["name"]
             .as_str()
             .unwrap_or("")
             .starts_with("Retained control")),
         "CSS-hidden retained controls leaked into refs: {snap}"
+    );
+    assert!(
+        refs.iter()
+            .all(|entry| entry["url"] != "/transactions/hidden-must-not-leak"),
+        "CSS-hidden link destination leaked into refs: {snap}"
     );
     assert_eq!(snap["snapshot"]["omitted"]["css_hidden"], 320);
 }
