@@ -150,7 +150,12 @@ pub(crate) async fn browser_protected_resource_scope(
     let (validated, live_origin) = engine
         .attest_protected_tab(&runtime_session, target_id, tab_id)
         .await
-        .map_err(|error| error.message)?;
+        // The generic protected-resource trait predates structured browser
+        // refusals and accepts only a String error. Carry only the closed wire
+        // code across that boundary: the registry restores it to a structured
+        // refusal, while the browser's human-readable message (which may
+        // contain a private target or provider value) stays inside the driver.
+        .map_err(|error| format!("browser_refusal_code:{}", error.code.as_str()))?;
     let target = validated.record;
     let tab = validated.tab;
     let requested_origin = if tool_name == "browser_navigate" {
