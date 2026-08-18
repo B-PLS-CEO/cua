@@ -232,6 +232,18 @@ fn large_semantic_document() -> Value {
         }),
         json!({
             "nodeType": 1,
+            "nodeName": "A",
+            "backendNodeId": 2_004,
+            "attributes": ["href", "/transactions/fixture-123"],
+            "children": [{
+                "nodeType": 3,
+                "nodeName": "#text",
+                "nodeValue": "Open transaction",
+                "backendNodeId": 2_005,
+            }],
+        }),
+        json!({
+            "nodeType": 1,
             "nodeName": "TEXTAREA",
             "backendNodeId": 2_010,
             "attributes": ["aria-label", "Reply body"],
@@ -298,6 +310,7 @@ fn large_semantic_ax_tree(frame_id: &str) -> Value {
     let mut child_ids = vec![
         "heading".to_owned(),
         "body".to_owned(),
+        "transaction-link".to_owned(),
         "editor".to_owned(),
         "reply".to_owned(),
     ];
@@ -326,6 +339,18 @@ fn large_semantic_ax_tree(frame_id: &str) -> Value {
             "backendDOMNodeId": 2003,
             "role": {"value": "StaticText"},
             "name": {"value": "Please review the attached fixture report."},
+            "childIds": []
+        }),
+        json!({
+            "nodeId": "transaction-link",
+            "parentId": "root-main",
+            "ignored": false,
+            "backendDOMNodeId": 2004,
+            "role": {"value": "link"},
+            "name": {"value": "Open transaction"},
+            "properties": [
+                {"name": "focusable", "value": {"value": true}}
+            ],
             "childIds": []
         }),
         json!({
@@ -509,11 +534,12 @@ fn fixture_handler(state: SharedState) -> MockHandler {
             ]})),
             "DOMSnapshot.captureSnapshot" if is_tab => {
                 if st.semantic_large_page {
-                    let mut backends = vec![999, 2000, 2003, 2010, 2011];
+                    let mut backends = vec![999, 2000, 2003, 2004, 2010, 2011];
                     let mut bounds = vec![
                         [0.0, 0.0, 800.0, 600.0],
                         [20.0, 20.0, 500.0, 40.0],
                         [20.0, 80.0, 600.0, 80.0],
+                        [20.0, 150.0, 160.0, 30.0],
                         [20.0, 180.0, 600.0, 120.0],
                         [20.0, 320.0, 100.0, 36.0],
                     ];
@@ -1436,6 +1462,21 @@ async fn semantic_snapshot_keeps_visible_content_after_hidden_node_pressure() {
                 .is_some_and(|actions| actions.iter().any(|action| action == "type"))),
         "visible editor was omitted: {snap}"
     );
+    let transaction_link = refs
+        .iter()
+        .find(|entry| entry["name"] == "Open transaction")
+        .expect("visible transaction link");
+    assert_eq!(transaction_link["role"], "link", "{transaction_link}");
+    assert_eq!(
+        transaction_link["url"], "/transactions/fixture-123",
+        "link destination must be exposed separately from the AX value: {transaction_link}"
+    );
+    assert_eq!(transaction_link["value"], Value::Null, "{transaction_link}");
+    let reply = refs
+        .iter()
+        .find(|entry| entry["name"] == "Reply")
+        .expect("visible Reply action");
+    assert_eq!(reply["url"], Value::Null, "non-links cannot acquire URLs");
     assert!(
         refs.iter().all(|entry| !entry["name"]
             .as_str()
