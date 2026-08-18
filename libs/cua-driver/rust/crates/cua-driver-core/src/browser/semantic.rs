@@ -118,6 +118,10 @@ pub(crate) struct SemanticNode {
     pub(crate) role: String,
     pub(crate) name: Option<String>,
     pub(crate) value: Option<String>,
+    /// Literal DOM href for link-shaped nodes. Kept separate from the AX
+    /// value because browsers commonly expose no AX value for links, while a
+    /// governed caller may still need the exact read-navigation identity.
+    pub(crate) link_url: Option<String>,
     pub(crate) states: BTreeMap<String, Value>,
     pub(crate) frame: FrameRef,
     pub(crate) visibility: BrowserVisibility,
@@ -525,6 +529,10 @@ pub(crate) fn compose_accessibility_tree(
         let actions = action_kinds(&role, dom_meta, &states, layout_meta);
         let name = ax_value_string(ax.get("name")).and_then(clean_semantic_text);
         let value = ax_value_string(ax.get("value")).and_then(clean_semantic_text);
+        let link_url = (role == "link")
+            .then(|| dom_meta?.attrs.get("href").cloned())
+            .flatten()
+            .and_then(clean_semantic_text);
         let document_order = dom_meta.map_or(fallback_order, |meta| meta.order);
         nodes.push(SemanticNode {
             ax_id,
@@ -546,6 +554,7 @@ pub(crate) fn compose_accessibility_tree(
             role,
             name,
             value,
+            link_url,
             states,
             frame: frame.clone(),
             visibility,
@@ -674,6 +683,10 @@ fn supplement_dom_actions(
             .iter()
             .find_map(|key| meta.attrs.get(*key).cloned())
             .and_then(clean_semantic_text);
+        let link_url = (role == "link")
+            .then(|| meta.attrs.get("href").cloned())
+            .flatten()
+            .and_then(clean_semantic_text);
         nodes.push(SemanticNode {
             ax_id: format!("dom-{backend_node_id}"),
             parent_ax_id: meta
@@ -688,6 +701,7 @@ fn supplement_dom_actions(
                 .get("value")
                 .cloned()
                 .and_then(clean_semantic_text),
+            link_url,
             states,
             frame: frame.clone(),
             visibility,

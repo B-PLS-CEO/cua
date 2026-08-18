@@ -214,6 +214,7 @@ fn semantic_ref_value(listed: &super::engine::SemanticListedRef) -> Value {
         "role": listed.node.role,
         "name": listed.node.name,
         "value": listed.node.value,
+        "url": listed.node.link_url,
         "states": listed.node.states,
         "actions": listed.node.actions.iter().map(|action| action.as_str()).collect::<Vec<_>>(),
         "frame": listed.node.frame.kind.as_str(),
