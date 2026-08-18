@@ -274,8 +274,17 @@ fn large_semantic_document() -> Value {
             "nodeName": "A",
             "backendNodeId": 2_013,
             "attributes": [
-                "href", "javascript:alert(1)",
-                "aria-label", "Unsafe observed link",
+                "href", r"/\user:secret@evil.test/path",
+                "aria-label", "Unsafe DOM observed link",
+            ],
+        }),
+        json!({
+            "nodeType": 1,
+            "nodeName": "A",
+            "backendNodeId": 2_014,
+            "attributes": [
+                "href", "javascript://[",
+                "aria-label", "Unsafe AX observed link",
             ],
         }),
         json!({
@@ -347,6 +356,7 @@ fn large_semantic_ax_tree(frame_id: &str) -> Value {
         "heading".to_owned(),
         "body".to_owned(),
         "transaction-link".to_owned(),
+        "unsafe-ax-link".to_owned(),
         "editor".to_owned(),
         "reply".to_owned(),
     ];
@@ -384,6 +394,18 @@ fn large_semantic_ax_tree(frame_id: &str) -> Value {
             "backendDOMNodeId": 2004,
             "role": {"value": "link"},
             "name": {"value": "Open transaction"},
+            "properties": [
+                {"name": "focusable", "value": {"value": true}}
+            ],
+            "childIds": []
+        }),
+        json!({
+            "nodeId": "unsafe-ax-link",
+            "parentId": "root-main",
+            "ignored": false,
+            "backendDOMNodeId": 2014,
+            "role": {"value": "link"},
+            "name": {"value": "Unsafe AX observed link"},
             "properties": [
                 {"name": "focusable", "value": {"value": true}}
             ],
@@ -570,7 +592,7 @@ fn fixture_handler(state: SharedState) -> MockHandler {
             ]})),
             "DOMSnapshot.captureSnapshot" if is_tab => {
                 if st.semantic_large_page {
-                    let mut backends = vec![999, 2000, 2003, 2004, 2010, 2011, 2012, 2013];
+                    let mut backends = vec![999, 2000, 2003, 2004, 2010, 2011, 2012, 2013, 2014];
                     let mut bounds = vec![
                         [0.0, 0.0, 800.0, 600.0],
                         [20.0, 20.0, 500.0, 40.0],
@@ -580,6 +602,7 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                         [20.0, 320.0, 100.0, 36.0],
                         [200.0, 320.0, 180.0, 36.0],
                         [400.0, 320.0, 180.0, 36.0],
+                        [600.0, 320.0, 180.0, 36.0],
                     ];
                     for id in 0..305_i64 {
                         backends.push(3_000 + id);
@@ -1519,14 +1542,23 @@ async fn semantic_snapshot_keeps_visible_content_after_hidden_node_pressure() {
         "a".repeat(1_500)
     );
     assert_eq!(dom_supplement["url"], expected_long_url, "{dom_supplement}");
-    let unsafe_link = refs
+    let unsafe_dom_link = refs
         .iter()
-        .find(|entry| entry["name"] == "Unsafe observed link")
-        .expect("unsafe link remains observable without a usable destination");
+        .find(|entry| entry["name"] == "Unsafe DOM observed link")
+        .expect("unsafe DOM link remains observable without a usable destination");
     assert_eq!(
-        unsafe_link["url"],
+        unsafe_dom_link["url"],
         Value::Null,
         "non-web schemes must remain inert"
+    );
+    let unsafe_ax_link = refs
+        .iter()
+        .find(|entry| entry["name"] == "Unsafe AX observed link")
+        .expect("unsafe AX link remains observable without a usable destination");
+    assert_eq!(
+        unsafe_ax_link["url"],
+        Value::Null,
+        "parser-error non-web schemes must remain inert"
     );
     let reply = refs
         .iter()
