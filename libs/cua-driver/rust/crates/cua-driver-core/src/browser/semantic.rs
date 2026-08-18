@@ -984,19 +984,36 @@ fn bounded_link_url(value: String) -> Option<String> {
         return None;
     }
 
-    // A base is required for browser-equivalent parsing. In particular, WHATWG
-    // special schemes treat backslashes like slashes, so a value that appears
-    // relative to a base-less parser can actually resolve to a credentialed
-    // network authority in Chromium.
-    let base = url::Url::parse("https://semantic-observation.invalid/").ok()?;
-    let parsed = url::Url::options()
-        .base_url(Some(&base))
-        .parse(&value)
-        .ok()?;
-    if !matches!(parsed.scheme(), "http" | "https")
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-    {
+    // Parse absolute values without a base first. Same-scheme hrefs without
+    // slashes can resolve differently depending on the document scheme, so a
+    // synthetic base must never reinterpret an absolute candidate as a safe
+    // relative path. Genuine relative hrefs are proved under both supported
+    // web document schemes; every browser interpretation must satisfy policy.
+    let parsed = match url::Url::parse(&value) {
+        Ok(parsed) => vec![parsed],
+        Err(url::ParseError::RelativeUrlWithoutBase) => {
+            let mut resolved = Vec::with_capacity(2);
+            for base_value in [
+                "http://semantic-observation.invalid/",
+                "https://semantic-observation.invalid/",
+            ] {
+                let base = url::Url::parse(base_value).ok()?;
+                resolved.push(
+                    url::Url::options()
+                        .base_url(Some(&base))
+                        .parse(&value)
+                        .ok()?,
+                );
+            }
+            resolved
+        }
+        Err(_) => return None,
+    };
+    if parsed.iter().any(|parsed| {
+        !matches!(parsed.scheme(), "http" | "https")
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+    }) {
         return None;
     }
 
@@ -1552,6 +1569,8 @@ mod tests {
         assert!(bounded_link_url("https://user:secret@fixture.test/document".to_owned()).is_none());
         assert!(bounded_link_url(r"\\user:secret@evil.test/path".to_owned()).is_none());
         assert!(bounded_link_url(r"/\user:secret@evil.test/path".to_owned()).is_none());
+        assert!(bounded_link_url("https:user:secret@evil.test/path".to_owned()).is_none());
+        assert!(bounded_link_url("http:user:secret@evil.test/path".to_owned()).is_none());
         assert!(bounded_link_url("javascript:alert(1)".to_owned()).is_none());
         assert!(bounded_link_url("javascript://[".to_owned()).is_none());
         assert!(bounded_link_url("data:text/plain,fixture".to_owned()).is_none());
