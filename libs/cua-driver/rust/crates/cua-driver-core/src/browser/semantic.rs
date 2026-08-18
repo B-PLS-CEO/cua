@@ -984,18 +984,20 @@ fn bounded_link_url(value: String) -> Option<String> {
         return None;
     }
 
-    let parsed = if value.starts_with("//") {
-        url::Url::parse(&format!("https:{value}")).ok()
-    } else {
-        url::Url::parse(&value).ok()
-    };
-    if let Some(parsed) = parsed {
-        if !matches!(parsed.scheme(), "http" | "https")
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-        {
-            return None;
-        }
+    // A base is required for browser-equivalent parsing. In particular, WHATWG
+    // special schemes treat backslashes like slashes, so a value that appears
+    // relative to a base-less parser can actually resolve to a credentialed
+    // network authority in Chromium.
+    let base = url::Url::parse("https://semantic-observation.invalid/").ok()?;
+    let parsed = url::Url::options()
+        .base_url(Some(&base))
+        .parse(&value)
+        .ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return None;
     }
 
     Some(value)
@@ -1548,7 +1550,10 @@ mod tests {
         ))
         .is_none());
         assert!(bounded_link_url("https://user:secret@fixture.test/document".to_owned()).is_none());
+        assert!(bounded_link_url(r"\\user:secret@evil.test/path".to_owned()).is_none());
+        assert!(bounded_link_url(r"/\user:secret@evil.test/path".to_owned()).is_none());
         assert!(bounded_link_url("javascript:alert(1)".to_owned()).is_none());
+        assert!(bounded_link_url("javascript://[".to_owned()).is_none());
         assert!(bounded_link_url("data:text/plain,fixture".to_owned()).is_none());
         assert!(bounded_link_url("/document\nother".to_owned()).is_none());
     }
