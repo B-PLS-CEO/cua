@@ -3887,6 +3887,15 @@ fn protected_consent_refusal(error: crate::consent::ConsentError) -> ToolResult 
 }
 
 fn protected_scope_refusal(message: &str) -> ToolResult {
+    if let Some(code) = message
+        .strip_prefix("browser_refusal_code:")
+        .and_then(crate::browser::BrowserRefusalCode::from_wire)
+    {
+        return protected_refusal(
+            code.as_str(),
+            "the protected browser resource could not be re-attested",
+        );
+    }
     protected_refusal("protected_resource_scope_invalid", message)
 }
 
@@ -4727,5 +4736,42 @@ mod capability_tests {
             .any(|adapter| {
                 adapter["id"] == "browser_prepare.existing_profile" && adapter["state"] == "active"
             }));
+    }
+
+    #[test]
+    fn protected_browser_scope_preserves_only_closed_refusal_codes() {
+        let recognized = protected_scope_refusal("browser_refusal_code:browser_binding_stale");
+        assert_eq!(
+            recognized
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.pointer("/refusal/code"))
+                .and_then(Value::as_str),
+            Some("browser_binding_stale")
+        );
+        assert_eq!(
+            recognized
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.pointer("/refusal/message"))
+                .and_then(Value::as_str),
+            Some("the protected browser resource could not be re-attested")
+        );
+
+        for unknown in [
+            "browser_refusal_code:private_or_future_code",
+            " browser_refusal_code:browser_binding_stale",
+            "browser_refusal_code:browser_binding_stale:private",
+        ] {
+            let generic = protected_scope_refusal(unknown);
+            assert_eq!(
+                generic
+                    .structured_content
+                    .as_ref()
+                    .and_then(|value| value.pointer("/refusal/code"))
+                    .and_then(Value::as_str),
+                Some("protected_resource_scope_invalid")
+            );
+        }
     }
 }
