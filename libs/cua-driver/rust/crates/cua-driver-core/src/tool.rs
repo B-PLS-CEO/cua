@@ -1107,7 +1107,7 @@ impl ToolRegistry {
                 .await
                 != ProtectedResourceOwnership::DriverOwned
         {
-            if let Err(error) = self
+            if let Err(refusal) = self
                 .authorize_private_observation(
                     tool.as_ref(),
                     resolved_name,
@@ -1117,7 +1117,7 @@ impl ToolRegistry {
                 )
                 .await
             {
-                return protected_consent_refusal(error);
+                return refusal;
             }
         }
         if has_adapter("clipboard") {
@@ -1474,7 +1474,7 @@ impl ToolRegistry {
         args: &Value,
         context: &crate::session_authorization::EffectiveAuthorizationContext,
         lifecycle_session: Option<&str>,
-    ) -> Result<(), crate::consent::ConsentError> {
+    ) -> Result<(), ToolResult> {
         if context.mode() == crate::authorization::PermissionMode::Unrestricted {
             return Ok(());
         }
@@ -1487,11 +1487,11 @@ impl ToolRegistry {
                 && tool
                     .protected_resource_scope("private_observation", args)
                     .await
-                    .map_err(crate::consent::ConsentError::Provider)?
+                    .map_err(|message| protected_scope_refusal(&message))?
                     .is_none()
             {
-                return Err(crate::consent::ConsentError::Provider(
-                    "browser observation did not attest a live top-level origin".to_owned(),
+                return Err(protected_scope_refusal(
+                    "browser observation did not attest a live top-level origin",
                 ));
             }
             // Whole-display scope discovery is X11-specific on Linux. It is
@@ -1502,7 +1502,7 @@ impl ToolRegistry {
         let browser_scope = tool
             .protected_resource_scope("private_observation", args)
             .await
-            .map_err(crate::consent::ConsentError::Provider)?;
+            .map_err(|message| protected_scope_refusal(&message))?;
         let (mut resource, summary) = if let Some(resource) = browser_scope {
             let target_id = browser_target.unwrap_or("unknown");
             (
@@ -1515,8 +1515,8 @@ impl ToolRegistry {
                 },
             )
         } else if browser_target.is_some() {
-            return Err(crate::consent::ConsentError::Provider(
-                "browser observation did not attest a live top-level origin".to_owned(),
+            return Err(protected_scope_refusal(
+                "browser observation did not attest a live top-level origin",
             ));
         } else if tool_name == "escalate_session" {
             (
@@ -1573,23 +1573,17 @@ impl ToolRegistry {
             let display = self
                 .tools
                 .get("get_screen_size")
-                .ok_or_else(|| {
-                    crate::consent::ConsentError::Provider(
-                        "display identity is unavailable".to_owned(),
-                    )
-                })?
+                .ok_or_else(|| protected_scope_refusal("display identity is unavailable"))?
                 .invoke(serde_json::json!({}))
                 .await;
             if display.is_error == Some(true) {
-                return Err(crate::consent::ConsentError::Provider(
-                    "display identity could not be read".to_owned(),
+                return Err(protected_scope_refusal(
+                    "display identity could not be read",
                 ));
             }
-            let display = display.structured_content.ok_or_else(|| {
-                crate::consent::ConsentError::Provider(
-                    "display identity was not returned".to_owned(),
-                )
-            })?;
+            let display = display
+                .structured_content
+                .ok_or_else(|| protected_scope_refusal("display identity was not returned"))?;
             (
                 serde_json::json!({
                     "kind": "display",
@@ -1617,7 +1611,8 @@ impl ToolRegistry {
                 Duration::from_secs(30 * 60),
                 Duration::from_secs(8 * 60 * 60),
             )
-            .await?;
+            .await
+            .map_err(protected_consent_refusal)?;
         Ok(())
     }
 
@@ -2541,6 +2536,12 @@ mod runtime_isolation_tests {
         def: super::ToolDef,
     }
 
+    struct ProtectedScopeRefusalProbe {
+        hits: Arc<AtomicUsize>,
+        scope_error: String,
+        def: super::ToolDef,
+    }
+
     struct ArgumentProbe {
         hits: Arc<AtomicUsize>,
         last_args: Arc<Mutex<Option<serde_json::Value>>>,
@@ -2614,6 +2615,26 @@ mod runtime_isolation_tests {
             self.hits.fetch_add(1, Ordering::SeqCst);
             crate::protocol::ToolResult::text("private state")
                 .with_structured(serde_json::json!({"snapshot_id": 1}))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for ProtectedScopeRefusalProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+
+        async fn protected_resource_scope(
+            &self,
+            _adapter_id: &str,
+            _args: &serde_json::Value,
+        ) -> Result<Option<serde_json::Value>, String> {
+            Err(self.scope_error.clone())
+        }
+
+        async fn invoke(&self, _args: serde_json::Value) -> crate::protocol::ToolResult {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            crate::protocol::ToolResult::text("scope refusal probe ran")
         }
     }
 
@@ -2906,6 +2927,61 @@ resources:
 
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert_ne!(result.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn browser_observation_preserves_closed_scope_refusal_before_dispatch() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut registry = super::ToolRegistry::new();
+        registry.register(Box::new(ProtectedScopeRefusalProbe {
+            hits: hits.clone(),
+            scope_error: "browser_refusal_code:browser_binding_stale".to_owned(),
+            def: super::ToolDef {
+                name: "get_browser_state".to_owned(),
+                description: "test protected browser observation".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                read_only: true,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+        }));
+        let registry = Arc::new(registry);
+        let bounded = bounded_context(
+            r#"
+version: 2
+mode: bounded
+expires_after: 1h
+idle_timeout: 30m
+resources: {}
+allow:
+  tools: [get_browser_state]
+"#,
+        );
+
+        for context in [standard_context(), bounded] {
+            let result = registry
+                .invoke_with_context(
+                    "get_browser_state",
+                    serde_json::json!({
+                        "target_id": "target",
+                        "tab_id": "tab",
+                        "session": "review"
+                    }),
+                    context,
+                )
+                .await;
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(
+                result
+                    .structured_content
+                    .as_ref()
+                    .and_then(|value| value.pointer("/refusal/code"))
+                    .and_then(serde_json::Value::as_str),
+                Some("browser_binding_stale")
+            );
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
