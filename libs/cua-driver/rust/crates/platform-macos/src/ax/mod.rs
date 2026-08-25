@@ -18,6 +18,7 @@
 
 pub mod bindings;
 pub mod cache;
+pub(crate) mod consent_scan;
 pub mod tree;
 pub mod window_scope;
 
