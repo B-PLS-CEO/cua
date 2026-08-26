@@ -6,7 +6,7 @@
 
 use std::io::Cursor;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex as StdMutex,
 };
 
@@ -1086,6 +1086,33 @@ async fn existing_profile_setup_fixture() -> (Fixture, Arc<AtomicBool>) {
     )
 }
 
+async fn closing_existing_profile_setup_fixture() -> (Fixture, Arc<AtomicUsize>) {
+    let state = Arc::new(StdMutex::new(FixtureState::default()));
+    let (server, accepted_connections) =
+        MockCdpServer::start_closing_first_connection_on_command(fixture_handler(state.clone()))
+            .await;
+    let setup_invoked = Arc::new(AtomicBool::new(false));
+    let engine = BrowserEngine::new(Arc::new(FixturePlatform {
+        ws_url: server.ws_url(),
+        trusted_input_limited: false,
+        managed_endpoint_visible: false,
+        existing_endpoint_visible: Arc::new(AtomicBool::new(false)),
+        setup_invoked: setup_invoked.clone(),
+        setup_aborted: Arc::new(AtomicBool::new(false)),
+        stall_consent: false,
+        user_decision_pending: false,
+    }));
+    (
+        Fixture {
+            state,
+            _server: server,
+            engine,
+            setup_invoked,
+        },
+        accepted_connections,
+    )
+}
+
 fn structured(result: &ToolResult) -> &Value {
     result
         .structured_content
@@ -1227,6 +1254,51 @@ async fn approved_existing_profile_setup_reports_exact_side_effects() {
         }))
         .await;
     assert_eq!(structured(&state)["status"], "ok", "{}", structured(&state));
+}
+
+#[tokio::test]
+async fn setup_commit_recovers_when_the_claimed_socket_closes_before_bind() {
+    let (f, accepted_connections) = closing_existing_profile_setup_fixture().await;
+    let token = super::approval::mint_existing_profile_approval(
+        super::approval::ExistingProfileApprovalScope {
+            pid: 1,
+            window_id: 7,
+            session: SESSION.to_owned(),
+        },
+    )
+    .unwrap();
+
+    let prepare = BrowserPrepareTool::new(f.engine.clone())
+        .invoke(json!({
+            "pid": 1,
+            "window_id": 7,
+            "session": SESSION,
+            "strategy": { "kind": "existing_profile" },
+            "approval_token": token
+        }))
+        .await;
+    let prepared = structured(&prepare);
+    assert_eq!(prepared["status"], "ok", "{prepared}");
+    assert_eq!(prepared["side_effects"]["closed_setup_page"], true);
+    assert_eq!(
+        accepted_connections.load(Ordering::SeqCst),
+        2,
+        "post-commit proof must replace only the stale claimed socket"
+    );
+
+    let state = GetBrowserStateTool::new(f.engine.clone())
+        .invoke(json!({
+            "pid": 1,
+            "window_id": 7,
+            "session": SESSION
+        }))
+        .await;
+    assert_eq!(structured(&state)["status"], "ok", "{}", structured(&state));
+    assert_eq!(
+        accepted_connections.load(Ordering::SeqCst),
+        2,
+        "the immediate bind must reuse the proven reconnect generation"
+    );
 }
 
 #[tokio::test]

@@ -1162,35 +1162,42 @@ impl BrowserEngine {
             self.pool.claim_existing(&endpoint.ws_url, grant.generation),
         )
         .await;
-        if let Err(_final_claim_error) = claimed {
-            self.revoke_existing_profile_grant(
-                &request.session,
-                request.transport_session.as_deref(),
-                request.pid,
-            )
-            .await;
-            let error = with_prepare_side_effects(
-                refusal(
-                    BrowserRefusalCode::BrowserReconnectExhausted,
-                    "the approved browser socket could not be claimed",
+        let claimed = match claimed {
+            Ok(claimed) => claimed,
+            Err(_final_claim_error) => {
+                self.revoke_existing_profile_grant(
+                    &request.session,
+                    request.transport_session.as_deref(),
+                    request.pid,
                 )
-                .with_detail(serde_json::json!({
-                    "retried_after_consent": initial_claim_error.is_some(),
-                    "fresh_claim_failed": initial_claim_error.is_some(),
-                    "user_presence": consent_evidence == ConsentEvidence::UserPresence,
-                })),
-                &setup,
-                displayed_consent_prompt,
-            );
-            if setup_pending {
-                return Err(setup_guard
-                    .as_mut()
-                    .expect("setup guard exists while setup is pending")
-                    .abort(error)
-                    .await);
+                .await;
+                let error = with_prepare_side_effects(
+                    refusal(
+                        BrowserRefusalCode::BrowserReconnectExhausted,
+                        "the approved browser socket could not be claimed",
+                    )
+                    .with_detail(serde_json::json!({
+                        "retried_after_consent": initial_claim_error.is_some(),
+                        "fresh_claim_failed": initial_claim_error.is_some(),
+                        "user_presence": consent_evidence == ConsentEvidence::UserPresence,
+                    })),
+                    &setup,
+                    displayed_consent_prompt,
+                );
+                if setup_pending {
+                    return Err(setup_guard
+                        .as_mut()
+                        .expect("setup guard exists while setup is pending")
+                        .abort(error)
+                        .await);
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
+        };
+        // The pool owns the claimed socket from here. Do not retain a second
+        // reference across setup commit: exact-generation invalidation must be
+        // able to close a route that commit proves stale.
+        drop(claimed);
         if setup_pending {
             match setup_guard
                 .as_mut()
@@ -1212,6 +1219,21 @@ impl BrowserEngine {
                         displayed_consent_prompt,
                     ));
                 }
+            }
+            if let Err(error) = self
+                .prove_existing_profile_post_setup_liveness(
+                    &request.session,
+                    request.transport_session.as_deref(),
+                    request.pid,
+                    grant.generation,
+                )
+                .await
+            {
+                return Err(with_prepare_side_effects(
+                    error,
+                    &setup,
+                    displayed_consent_prompt,
+                ));
             }
         }
         self.store
