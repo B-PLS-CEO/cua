@@ -517,6 +517,22 @@ impl CdpPool {
         Ok(conn)
     }
 
+    /// Remove only the exact grant-owned socket generation while preserving
+    /// ownership of its loopback listener. This is used when a protocol probe
+    /// proves the socket dead before the reader task has observed closure; the
+    /// browser engine still owns any bounded reconnect and grant transition.
+    pub async fn invalidate_existing_generation(&self, ws_url: &str, generation: u64) -> bool {
+        let mut conns = self.conns.lock().await;
+        if conns
+            .get(ws_url)
+            .is_some_and(|entry| entry.generation == Some(generation))
+        {
+            conns.remove(ws_url);
+            return true;
+        }
+        false
+    }
+
     /// Drop a (likely dead) connection so the next call redials.
     pub async fn evict(&self, ws_url: &str) {
         self.conns.lock().await.remove(ws_url);
@@ -652,6 +668,31 @@ mod tests {
             pool.get(&url).await.is_ok(),
             "session cleanup releases ownership"
         );
+    }
+
+    #[tokio::test]
+    async fn exact_generation_invalidation_preserves_claimed_listener_ownership() {
+        let server = MockCdpServer::start(StdArc::new(|_| MockReply::ok(json!({})))).await;
+        let url = server.ws_url();
+        let pool = CdpPool::new();
+        let claimed = pool.claim_existing(&url, 2).await.unwrap();
+
+        assert!(!pool.invalidate_existing_generation(&url, 1).await);
+        assert!(Arc::ptr_eq(
+            &claimed,
+            &pool.get_existing(&url, 2).await.unwrap()
+        ));
+        assert!(endpoint_port_is_grant_owned(&url));
+
+        assert!(pool.invalidate_existing_generation(&url, 2).await);
+        assert!(pool.get_existing(&url, 2).await.is_err());
+        assert!(
+            endpoint_port_is_grant_owned(&url),
+            "socket invalidation must not release the grant-owned listener"
+        );
+
+        pool.release_claim_marker(&url);
+        assert!(!endpoint_port_is_grant_owned(&url));
     }
 
     #[tokio::test]

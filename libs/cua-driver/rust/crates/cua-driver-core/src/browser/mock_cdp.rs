@@ -9,6 +9,7 @@
 //! deterministic (no sleeps, no polling).
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
@@ -72,15 +73,35 @@ pub(crate) struct MockCdpServer {
 
 impl MockCdpServer {
     pub async fn start(handler: MockHandler) -> Self {
+        Self::start_inner(handler, false).await.0
+    }
+
+    /// Start an endpoint whose first accepted connection closes when it
+    /// receives its first command. This models a setup-owned DevTools socket
+    /// that becomes stale exactly when the embedding platform commits setup.
+    pub async fn start_closing_first_connection_on_command(
+        handler: MockHandler,
+    ) -> (Self, Arc<AtomicUsize>) {
+        Self::start_inner(handler, true).await
+    }
+
+    async fn start_inner(
+        handler: MockHandler,
+        close_first_connection_on_command: bool,
+    ) -> (Self, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
+        let accepted_connections = Arc::new(AtomicUsize::new(0));
+        let accepted_connections_for_task = accepted_connections.clone();
         let accept_task = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     break;
                 };
+                let connection_number =
+                    accepted_connections_for_task.fetch_add(1, Ordering::SeqCst) + 1;
                 let handler = handler.clone();
                 tokio::spawn(async move {
                     let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
@@ -94,6 +115,10 @@ impl MockCdpServer {
                         let Some(id) = v.get("id").and_then(Value::as_u64) else {
                             continue;
                         };
+                        if close_first_connection_on_command && connection_number == 1 {
+                            let _ = ws.close(None).await;
+                            return;
+                        }
                         let call = MockCall {
                             method: v
                                 .get("method")
@@ -133,7 +158,7 @@ impl MockCdpServer {
                 });
             }
         });
-        Self { addr, accept_task }
+        (Self { addr, accept_task }, accepted_connections)
     }
 
     pub fn ws_url(&self) -> String {

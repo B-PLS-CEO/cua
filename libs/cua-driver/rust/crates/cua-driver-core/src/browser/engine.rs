@@ -1011,6 +1011,90 @@ impl BrowserEngine {
         })))
     }
 
+    /// Prove that the exact socket claimed during an existing-profile setup
+    /// remains usable after the platform commits that setup. Chrome may close
+    /// or rotate the setup-owned route before the WebSocket reader publishes
+    /// its closed state. In that narrow case, preserve listener ownership and
+    /// use the ordinary bounded reconnect path for the same grant identity.
+    pub(super) async fn prove_existing_profile_post_setup_liveness(
+        &self,
+        session: &str,
+        transport_session: Option<&str>,
+        pid: i64,
+        expected_generation: u64,
+    ) -> Result<(), BrowserRefusal> {
+        let grant = self
+            .existing_profile_grant(session, transport_session, pid)
+            .await?
+            .ok_or_else(|| {
+                refuse(
+                    BrowserRefusalCode::BrowserConsentRequired,
+                    "the existing-profile grant ended before setup liveness could be proven",
+                )
+            })?;
+        if grant.generation != expected_generation {
+            return Err(refuse(
+                BrowserRefusalCode::BrowserBindingStale,
+                "the existing-profile connection generation changed while setup was committing",
+            ));
+        }
+
+        let first_probe_succeeded = match self
+            .pool
+            .get_existing(&grant.endpoint_ws_url, grant.generation)
+            .await
+        {
+            Ok(conn) => conn
+                .call(None, "Target.getTargets", json!({}))
+                .await
+                .is_ok(),
+            Err(_) => false,
+        };
+        if first_probe_succeeded {
+            return Ok(());
+        }
+
+        self.pool
+            .invalidate_existing_generation(&grant.endpoint_ws_url, grant.generation)
+            .await;
+        let (conn, reconnected_grant) = match self
+            .connect_existing_profile(session, transport_session, pid)
+            .await
+        {
+            Ok(reconnected) => reconnected,
+            Err(error) => {
+                self.revoke_existing_profile_grant(session, transport_session, pid)
+                    .await;
+                return Err(error);
+            }
+        };
+        if conn
+            .call(None, "Target.getTargets", json!({}))
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+
+        drop(conn);
+        self.pool
+            .invalidate_existing_generation(
+                &reconnected_grant.endpoint_ws_url,
+                reconnected_grant.generation,
+            )
+            .await;
+        self.revoke_existing_profile_grant(session, transport_session, pid)
+            .await;
+        Err(refuse(
+            BrowserRefusalCode::BrowserReconnectExhausted,
+            "the approved browser socket did not remain live after setup commit",
+        )
+        .with_detail(json!({
+            "post_setup_liveness_probe": "failed",
+            "retryable": false,
+        })))
+    }
+
     async fn connection_for_record(
         &self,
         session: &str,
